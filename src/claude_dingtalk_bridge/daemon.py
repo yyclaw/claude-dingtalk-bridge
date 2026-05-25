@@ -119,6 +119,41 @@ def build_image_prompt(parts: list[tuple[str, str]]) -> str:
     return f"I sent you {noun}: {rendered}. Please take a look."
 
 
+def _mask_sender(sender: str | None) -> str:
+    # Sender staff id can identify a real person; the inbound log is the only
+    # place we routinely emit it, so mask to first-3 + ****** + last-3.
+    if not sender:
+        return "?"
+    return f"{sender[:3]}******{sender[-3:]}"
+
+
+def _log_inbound(msg: dingtalk_stream.ChatbotMessage) -> None:
+    """Log a one-line summary of every inbound callback before dispatch.
+
+    Single most important debugging aid: when the user reports "I sent a
+    message and nothing happened", this line tells us whether the daemon ever
+    saw the message and which msgtype it had. Preview is short and
+    single-line to keep one message per log line.
+    """
+    sender = _mask_sender(msg.sender_staff_id)
+    mt = msg.message_type
+    if mt == "text":
+        preview = (msg.text.content or "").strip().splitlines()[0:1]
+        snippet = (preview[0] if preview else "")[:60]
+        logger.info('inbound msgtype=text sender=%s preview="%s"', sender, snippet)
+    elif mt == "richText":
+        items = msg.rich_text_content.rich_text_list or []
+        texts = sum(1 for it in items if it.get("text"))
+        images = sum(1 for it in items if it.get("downloadCode"))
+        other = len(items) - texts - images
+        logger.info(
+            "inbound msgtype=richText sender=%s text_items=%d image_items=%d other_items=%d",
+            sender, texts, images, other,
+        )
+    else:
+        logger.info("inbound msgtype=%s sender=%s", mt, sender)
+
+
 class _ChatHandler(dingtalk_stream.ChatbotHandler):
     def __init__(self, orchestrator: Orchestrator):
         super().__init__()
@@ -127,6 +162,10 @@ class _ChatHandler(dingtalk_stream.ChatbotHandler):
     async def process(self, callback: dingtalk_stream.CallbackMessage):
         try:
             msg = dingtalk_stream.ChatbotMessage.from_dict(callback.data)
+            # Log every callback BEFORE dispatch — the next "I sent a message
+            # and nothing happened" report can immediately confirm whether the
+            # message reached the daemon at all (and which branch took it).
+            _log_inbound(msg)
             if msg.message_type == "text":
                 text = msg.text.content.strip()
                 await self._orchestrator.handle_message(text, msg.sender_staff_id)
@@ -139,6 +178,19 @@ class _ChatHandler(dingtalk_stream.ChatbotHandler):
                 )
             elif msg.message_type in ("picture", "richText"):
                 await self._handle_image_message(msg)
+            else:
+                # Unknown msgtype (file, link, sticker, future DingTalk types).
+                # Authorized senders get a phone notice so a stuck message
+                # doesn't look like a hung daemon; strangers get nothing.
+                logger.warning(
+                    "unsupported msgtype=%s sender=%s",
+                    msg.message_type, msg.sender_staff_id,
+                )
+                if self._orchestrator.is_authorized(msg.sender_staff_id):
+                    await self._orchestrator.notify(
+                        f"🤔 Got a `{msg.message_type}` message — I can only "
+                        f"handle text, voice, and images."
+                    )
         except Exception:  # noqa: BLE001 - never let one bad message kill the loop
             logger.exception("Failed to handle inbound message")
         return AckMessage.STATUS_OK, "OK"
@@ -169,6 +221,12 @@ class _ChatHandler(dingtalk_stream.ChatbotHandler):
                 elif item.get("downloadCode"):
                     raw_parts.append(("image", item["downloadCode"]))
         if not any(kind == "image" for kind, _ in raw_parts):
+            # No image to download — but text items (a sticker / @-mention
+            # bundled with text, etc.) used to fall on the floor here. Salvage
+            # the text as a regular prompt so the user's intent isn't lost.
+            text = "".join(v for k, v in raw_parts if k == "text").strip()
+            if text:
+                await self._orchestrator.handle_message(text, msg.sender_staff_id)
             return
         parts: list[tuple[str, str]] = []
         for kind, value in raw_parts:

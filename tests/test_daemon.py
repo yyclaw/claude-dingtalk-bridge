@@ -294,15 +294,49 @@ async def test_chat_handler_swallows_handler_exceptions():
     assert body == "OK"
 
 
-async def test_chat_handler_richtext_without_image_runs_nothing():
+async def test_chat_handler_richtext_without_image_falls_back_to_text():
+    # A richText made of text items only (a sticker / emoji bundled with text,
+    # an @-mention without payload, …) used to be silently dropped. Salvage
+    # the text so the user's intent isn't lost.
     orch = _RecordingOrchestrator()
     handler = _ChatHandler(orch)
     await handler.process(_FakeCallback({
         "msgtype": "richText",
         "senderStaffId": "staff-1",
-        "content": {"richText": [{"text": "just words"}]},
+        "content": {"richText": [
+            {"text": "just"},
+            {"text": " words"},
+            {"type": "at", "atUserId": "u1"},
+        ]},
     }))
     assert orch.images == []
+    assert orch.messages == [("just words", "staff-1")]
+
+
+async def test_chat_handler_richtext_with_no_text_no_image_is_silent():
+    # richText with only @-mentions / unknown items (no text, no image) has
+    # nothing to salvage — silently dropped is the right answer here.
+    orch = _RecordingOrchestrator()
+    handler = _ChatHandler(orch)
+    await handler.process(_FakeCallback({
+        "msgtype": "richText",
+        "senderStaffId": "staff-1",
+        "content": {"richText": [{"type": "at", "atUserId": "u1"}]},
+    }))
+    assert orch.messages == [] and orch.images == []
+
+
+async def test_chat_handler_richtext_text_only_unauthorized_is_dropped():
+    # Auth check still gates the text fallback — an unauthorized sender's
+    # text from a richText must not reach handle_message.
+    orch = _RecordingOrchestrator()
+    handler = _ChatHandler(orch)
+    await handler.process(_FakeCallback({
+        "msgtype": "richText",
+        "senderStaffId": "stranger",
+        "content": {"richText": [{"text": "hi"}]},
+    }))
+    assert orch.messages == [] and orch.images == []
 
 
 def test_fetch_image_resolves_download_code(monkeypatch):
@@ -487,18 +521,71 @@ async def test_drive_stream_client_reconnects_on_exception(monkeypatch):
     assert client.calls == 3
 
 
-async def test_chat_handler_ignores_unknown_message_type():
-    # A message type the handler has no branch for (file, link, …) is
-    # acknowledged but dispatched nowhere.
+async def test_chat_handler_unknown_message_type_notifies_user(caplog):
+    # A message type the handler has no branch for (file, link, sticker, …)
+    # used to be silently dropped. Surface it to the phone AND log it so the
+    # next "I sent a message but nothing happened" leaves a trail.
+    import logging
     orch = _RecordingOrchestrator()
     handler = _ChatHandler(orch)
-    await handler.process(_FakeCallback({
-        "msgtype": "file",
-        "senderStaffId": "staff-1",
-    }))
+    with caplog.at_level(logging.WARNING, logger="claude_dingtalk_bridge.daemon"):
+        await handler.process(_FakeCallback({
+            "msgtype": "file",
+            "senderStaffId": "staff-1",
+        }))
     assert orch.messages == []
     assert orch.audios == []
     assert orch.images == []
+    assert len(orch.notices) == 1 and "file" in orch.notices[0]
+    assert any("unsupported msgtype" in r.getMessage() and "file" in r.getMessage()
+               for r in caplog.records)
+
+
+async def test_chat_handler_unknown_message_type_unauthorized_is_silent(caplog):
+    # An unauthorized sender's unknown msgtype must NOT trigger a phone
+    # notify (which would leak to whoever is testing the bot from outside).
+    import logging
+    orch = _RecordingOrchestrator()
+    handler = _ChatHandler(orch)
+    with caplog.at_level(logging.WARNING, logger="claude_dingtalk_bridge.daemon"):
+        await handler.process(_FakeCallback({
+            "msgtype": "file",
+            "senderStaffId": "stranger",
+        }))
+    assert orch.notices == []
+
+
+async def test_chat_handler_logs_every_inbound_message(caplog):
+    # The single most important debug aid: every callback that reaches
+    # process() must leave a log line, so a "I sent a message and the daemon
+    # did nothing" report can immediately confirm where the silence started.
+    import logging
+    orch = _RecordingOrchestrator()
+    handler = _ChatHandler(orch)
+    with caplog.at_level(logging.INFO, logger="claude_dingtalk_bridge.daemon"):
+        await handler.process(_FakeCallback({
+            "msgtype": "text",
+            "senderStaffId": "staff-1",
+            "text": {"content": "hello"},
+        }))
+        await handler.process(_FakeCallback({
+            "msgtype": "audio",
+            "senderStaffId": "staff-1",
+            "content": {"recognition": "fix bug", "downloadCode": "x"},
+        }))
+        await handler.process(_FakeCallback({
+            "msgtype": "file",
+            "senderStaffId": "staff-1",
+        }))
+    inbound = [r.getMessage() for r in caplog.records
+               if r.getMessage().startswith("inbound ")]
+    assert len(inbound) == 3
+    # Sender id is masked to first-3 + ****** + last-3; raw value must not leak.
+    masked = "sta******f-1"
+    assert all("staff-1" not in m for m in inbound)
+    assert any("msgtype=text" in m and masked in m for m in inbound)
+    assert any("msgtype=audio" in m and masked in m for m in inbound)
+    assert any("msgtype=file" in m and masked in m for m in inbound)
 
 
 async def test_chat_handler_richtext_drops_non_text_non_image_items():
