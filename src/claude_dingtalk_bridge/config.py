@@ -48,6 +48,16 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
     path = Path(path).expanduser()
     if not path.exists():
         raise ConfigError(f"Config file not found: {path}")
+    # The config holds the DingTalk client_secret; anyone who can read it
+    # can send messages as the bot for ~2 hours. Refuse looser-than-owner
+    # perms, same bar ssh sets for private keys. `make config` already
+    # chmods 600, so this fires only when the file was created by hand.
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        raise ConfigError(
+            f"Config file is too permissive (mode {mode:04o}): {path}\n"
+            f"Run `chmod 600 \"{path}\"` to restrict it to the owner."
+        )
     raw = yaml.safe_load(path.read_text()) or {}
     try:
         dingtalk = raw["dingtalk"]
