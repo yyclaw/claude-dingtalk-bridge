@@ -55,6 +55,8 @@ make config           # create ~/.config/claude-dingtalk-bridge/config.yaml
 #    then edit that file: client_id, client_secret, authorized_user_id, projects
 
 # 4. Run as a background daemon that starts at login
+#    (requires Xcode command line tools — install once with
+#     `xcode-select --install` if you don't have them)
 make daemon-install
 make daemon-start
 ```

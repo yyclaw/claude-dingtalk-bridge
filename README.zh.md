@@ -49,6 +49,8 @@ make config           # 创建 ~/.config/claude-dingtalk-bridge/config.yaml
 #    然后编辑该文件：client_id、client_secret、authorized_user_id、projects
 
 # 4. 作为开机自启的后台守护进程运行
+#    （需要 Xcode 命令行工具 —— 若未安装，先执行一次
+#     `xcode-select --install`）
 make daemon-install
 make daemon-start
 ```
