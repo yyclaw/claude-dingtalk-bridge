@@ -7,6 +7,7 @@ from claude_dingtalk_bridge.config import Config, GeoConfig, PermissionRules, Pr
 from claude_dingtalk_bridge.daemon import (
     _ChatHandler,
     _disable_websocket_proxy,
+    _mask_sender,
     _silence_cancellederror_noise,
     build_image_prompt,
     build_orchestrator,
@@ -586,6 +587,14 @@ async def test_chat_handler_logs_every_inbound_message(caplog):
     assert any("msgtype=text" in m and masked in m for m in inbound)
     assert any("msgtype=audio" in m and masked in m for m in inbound)
     assert any("msgtype=file" in m and masked in m for m in inbound)
+
+
+def test_mask_sender_masks_long_value_and_handles_empty():
+    # Normal-length staff id: first-3 + ****** + last-3.
+    assert _mask_sender("staff-12345") == "sta******345"
+    # Empty / missing sender falls back to "?" so the log line stays parseable.
+    assert _mask_sender("") == "?"
+    assert _mask_sender(None) == "?"
 
 
 async def test_chat_handler_richtext_drops_non_text_non_image_items():
