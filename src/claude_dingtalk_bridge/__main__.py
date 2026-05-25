@@ -1,0 +1,4 @@
+from claude_dingtalk_bridge.daemon import run
+
+if __name__ == "__main__":
+    run()

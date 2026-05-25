@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-dingtalk-bridge"
+version = "0.1.0"
+description = "Drive Claude Code remotely from a phone via DingTalk Stream mode"
+requires-python = ">=3.10"
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+    "dingtalk-stream>=0.24.0",
+    "PyYAML>=6.0",
+    "requests>=2.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0"]
+
+[project.scripts]
+claude-dingtalk-bridge = "claude_dingtalk_bridge.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_dingtalk_bridge"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["claude_dingtalk_bridge"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
