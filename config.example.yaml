@@ -14,7 +14,7 @@ projects:
 # Permission allowlist: a match is auto-approved, otherwise it escalates
 # to the phone for confirmation.
 #
-# Two footguns to keep in mind:
+# Footguns to keep in mind:
 #  - allowed_tools is an exact tool-name match checked FIRST. Listing Bash,
 #    Edit or Write here auto-approves *every* such call and bypasses the
 #    shell-metacharacter and project-directory checks below. Keep it to
@@ -23,6 +23,11 @@ projects:
 #    broad prefix like "git" or "npm" auto-approves every subcommand
 #    (e.g. `npm install`, which runs arbitrary install scripts). Prefer
 #    specific, harmless prefixes such as "git status".
+#  - allowed_bash does NOT block shell tilde expansion: a prefix like "rm"
+#    would auto-approve `rm ~/important` because the shell expands `~` to
+#    $HOME at runtime. Keep destructive or shell-launching commands (`rm`,
+#    `mv`, `cp`, `dd`, `bash`, `sh`, `eval`) OUT of this list and let them
+#    escalate to the phone each time.
 permissions:
   allow_edits_in_project: true     # auto-approve file edits inside the current project
   allowed_tools:                   # auto-approved tools (keep read-only — see note above)
