@@ -115,6 +115,27 @@ on the phone; reply with a number or type your own answer.
 | `ok` / `yes` / `approve` | Approve a permission request |
 | `no` / `deny` / `reject` | Deny a permission request |
 
+## Security
+
+### Inbound access
+- Outbound-only Stream WebSocket — the daemon listens on no ports and needs no public IP. **No tunneling involved, so corporate red lines on inbound exposure stay uncrossed.**
+- Single-user whitelist — only the account named in `authorized_user_id` can drive Claude. **No other DingTalk account can control the daemon on your machine.**
+- Image messages authenticate the sender before any download — an unauthorized user cannot use one image to trigger any network I/O, closing a download-DoS vector.
+
+### Claude tool permissions
+- **Any write outside the project directory needs your phone tap.** `Edit` / `Write`-class tools must resolve (after `..` and symlink normalization) under the active project, otherwise the call escalates to the phone. **Even Claude Code's auto mode cannot bypass this layer** — the permission callback lives on the SDK boundary, independent of Claude's own decisions.
+- **Bash and friends go through an allowlist with strict prefix matching** (`git` does not silently extend to `gitleaks`); any command containing shell metacharacters (`&&`, `|`, `;`, `>`, `<`, backticks, `$(`, glob characters, …) is detected and escalated regardless — chained commands cannot smuggle past the allowlist.
+
+### Local file permissions
+- `config.yaml` is checked at startup; anything looser than `0600` is refused with a `chmod` hint, and `make config` already locks it down on creation — prevents other local users on the same machine from reading your DingTalk `client_secret`.
+- The image cache directory is created with `0700` and actively refuses a symlinked parent — guards against pre-creation symlink attacks (an attacker swapping the target path with a symlink before our `mkdir` lands, redirecting our writes to wherever they want).
+
+### Claude Code account safety
+Before each turn, the daemon checks the exit IP's country code against the value in your `geo` config; a mismatch terminates the turn — **lowering the risk of Claude Code account flags or bans** from unexpected geographies.
+
+### Phone-side kill switch
+Send `/stop` from your phone to interrupt the current turn, or `/clear` to reset the whole session — if a task runs off the rails, the brake is always within reach.
+
 ## More commands
 
 All operations are wrapped in the `Makefile`; run `make` with no arguments to
