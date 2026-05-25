@@ -1,0 +1,52 @@
+# Copy to ~/.config/claude-dingtalk-bridge/config.yaml and fill in.
+dingtalk:
+  client_id: "YOUR_APP_KEY"        # DingTalk Open Platform app Client ID (AppKey)
+  client_secret: "YOUR_APP_SECRET" # Client Secret (AppSecret)
+
+# Only messages from this DingTalk user are processed (your own staffId).
+authorized_user_id: "YOUR_STAFF_ID"
+
+# Allowed project directories (the first one is the default project).
+projects:
+  - name: hello-world
+    path: ~/Projects/hello-world
+
+# Permission allowlist: a match is auto-approved, otherwise it escalates
+# to the phone for confirmation.
+#
+# Two footguns to keep in mind:
+#  - allowed_tools is an exact tool-name match checked FIRST. Listing Bash,
+#    Edit or Write here auto-approves *every* such call and bypasses the
+#    shell-metacharacter and project-directory checks below. Keep it to
+#    genuinely read-only tools.
+#  - allowed_bash prefixes match only the command's first word(s), so a
+#    broad prefix like "git" or "npm" auto-approves every subcommand
+#    (e.g. `npm install`, which runs arbitrary install scripts). Prefer
+#    specific, harmless prefixes such as "git status".
+permissions:
+  allow_edits_in_project: true     # auto-approve file edits inside the current project
+  allowed_tools:                   # auto-approved tools (keep read-only — see note above)
+    - Read
+    - Glob
+    - Grep
+  allowed_bash:                    # auto-approved Bash command prefixes (exact, or prefix + space)
+    - "git status"
+    - "git diff"
+    - "git log"
+    - "ls"
+    - "cat"
+    - "pnpm test"
+    - "go test"
+
+# Timeout (seconds) for a permission request; denied automatically on timeout.
+permission_timeout_seconds: 600
+
+# # Geo gate (optional): omit the whole section to skip the check and the proxy.
+# geo:
+#   proxy_url: http://127.0.0.1:8118      # local proxy address, shared by http/https
+#   target_country: US                    # expected exit-IP countryCode
+#   # ip-api.com's free tier is HTTP-only (HTTPS needs a paid plan), so this
+#   # request is unencrypted: a network MITM could spoof the country and
+#   # defeat the gate. Point this at an HTTPS endpoint if you have one.
+#   geo_service: http://ip-api.com/json   # returns the caller's exit IP geolocation
+#   timeout_seconds: 3                    # geo service request timeout, in seconds
