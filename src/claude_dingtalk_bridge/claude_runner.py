@@ -28,7 +28,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
 from claude_dingtalk_bridge import log_context
-from claude_dingtalk_bridge.sessions import collapse_inline_paths, display_path, format_tokens
+from claude_dingtalk_bridge.display import collapse_inline_paths, display_path, format_tokens
 
 logger = logging.getLogger(__name__)
 

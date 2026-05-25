@@ -22,14 +22,16 @@ from claude_dingtalk_bridge import log_context
 from claude_dingtalk_bridge.permissions import Decision, PermissionPolicy
 from claude_dingtalk_bridge.projects import ProjectRegistry
 from claude_dingtalk_bridge.questions import format_question, parse_answer
-from claude_dingtalk_bridge.sessions import (
+from claude_dingtalk_bridge.display import (
     display_path,
+    format_tokens,
+    md_escape,
+)
+from claude_dingtalk_bridge.sessions import (
     find_session,
     format_session_list,
-    format_tokens,
     is_uuid,
     list_recent_sessions,
-    md_escape,
     session_transcript_path,
 )
 
@@ -675,7 +677,7 @@ class Orchestrator:
         )
         log_context.set_turn(turn_num)
         log_context.set_session(self._runner.current_session(project.path))
-        # cwd lets sessions.collapse_inline_paths shorten tool input paths
+        # cwd lets display.collapse_inline_paths shorten tool input paths
         # (`/long/proj/src/x` → `src/x`); paths outside the project but
         # inside $HOME render as `~/…`.
         log_context.set_cwd(project.path)

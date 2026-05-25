@@ -182,7 +182,7 @@ breakdown.
   bulleted lines so they read well on a phone.
 - The daemon must never let one bad message kill the loop — handlers catch
   broadly and log.
-- Reuse the formatting helpers in `sessions.py` instead of inlining new
+- Reuse the formatting helpers in `display.py` instead of inlining new
   versions:
   - `format_tokens(n)` for token counts (`1.2K` / `45K` / `1.5M`).
   - Anywhere a filesystem path is rendered to the phone or log, apply the
