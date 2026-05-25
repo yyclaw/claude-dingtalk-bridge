@@ -93,6 +93,11 @@ def test_download_image_prunes_stale_files_tolerating_errors(monkeypatch, tmp_pa
     stale.write_bytes(b"old")
     os.utime(stale, (0, 0))  # epoch mtime — far older than the retention window
     monkeypatch.setattr(images, "_IMAGE_DIR", cache)
+    # _last_prune is module-level state — a prior test in the same session
+    # may have already ticked it forward, which would short-circuit the prune
+    # scan before it reaches the iterdir loop. Reset so this test always
+    # exercises the loop body.
+    monkeypatch.setattr(images, "_last_prune", 0.0)
 
     # Make the prune unlink raise so the OSError tolerance path is exercised.
     def boom(self, *args, **kwargs):
@@ -104,3 +109,6 @@ def test_download_image_prunes_stale_files_tolerating_errors(monkeypatch, tmp_pa
     )
     path = images.download_image("http://example.com/x")
     assert path.read_bytes() == b"fresh"
+    # The stale file is still there — boom() blocked the unlink, but the
+    # OSError was swallowed so download_image still succeeded.
+    assert stale.exists()

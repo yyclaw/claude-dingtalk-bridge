@@ -39,6 +39,31 @@ def test_build_options_sets_cwd():
     assert options.cwd == "/tmp/proj"
 
 
+def test_format_elapsed_sub_second_renders_ms():
+    from claude_dingtalk_bridge.claude_runner import _format_elapsed
+    assert _format_elapsed(0.42) == "420ms"
+
+
+def test_format_elapsed_one_second_or_more_renders_seconds():
+    from claude_dingtalk_bridge.claude_runner import _format_elapsed
+    assert _format_elapsed(4.25) == "4.2s"
+    assert _format_elapsed(1.0) == "1.0s"
+
+
+def test_format_unix_ts_returns_none_for_none():
+    from claude_dingtalk_bridge.claude_runner import _format_unix_ts
+    assert _format_unix_ts(None) is None
+
+
+def test_format_unix_ts_falls_back_to_raw_on_bad_value():
+    # An out-of-range timestamp (Y10K+) raises OSError/OverflowError on
+    # fromtimestamp. The renderer degrades to the raw integer rather than
+    # crashing the log line.
+    from claude_dingtalk_bridge.claude_runner import _format_unix_ts
+    huge = 10**15
+    assert _format_unix_ts(huge) == str(huge)
+
+
 def test_build_options_omits_resume_when_no_session():
     runner = ClaudeRunner()
     options = runner._build_options("/tmp/proj")
@@ -167,6 +192,13 @@ def test_tool_summary_for_ask_user_question_multiple_shows_count():
         ]},
     )
     assert out == "Which DB? (×3)"
+
+
+def test_tool_summary_for_ask_user_question_empty_list():
+    # Degenerate input — empty questions list. Returns empty so the tool
+    # entry renders as bare `AskUserQuestion#<id>` rather than crashing.
+    assert tool_summary("AskUserQuestion", {"questions": []}) == ""
+    assert tool_summary("AskUserQuestion", {}) == ""
 
 
 def test_tool_summary_collapses_project_path_in_file_tool():
@@ -2427,4 +2459,256 @@ async def test_drain_settle_resets_on_each_incoming_message(monkeypatch):
     )
     assert any(
         isinstance(e, TextEvent) and e.text == "late relay" for e in events
+    )
+
+
+# --- defensive-rendering coverage -------------------------------------------
+
+def test_summary_permission_denied_skips_none_and_empty_values():
+    # The data dump filter drops None / "" so the rendered line stays signal-
+    # only. Without it, every nullable SDK field would print as `field=None`.
+    msg = SystemMessage(
+        subtype="permission_denied",
+        data={"tool_name": "Bash", "reason": None, "detail": ""},
+    )
+    summary = _sdk_message_summary(msg)
+    assert "tool_name=Bash" in summary
+    assert "reason=" not in summary
+    assert "detail=" not in summary
+
+
+def test_summary_init_without_cwd_renders_without_cwd_field():
+    # Missing cwd in init data: the field is just dropped, the rest still
+    # renders. Don't synthesise a placeholder.
+    msg = SystemMessage(
+        subtype="init",
+        data={"model": "opus", "permissionMode": "auto", "claude_code_version": "1.0"},
+    )
+    summary = _sdk_message_summary(msg)
+    assert "model=opus" in summary
+    assert "cwd=" not in summary
+
+
+def test_summary_system_message_with_unknown_subtype_returns_subtype_field():
+    # A SystemMessage with a subtype we don't promote to a verb falls through
+    # to a bare `subtype=<x>` rendering rather than crashing or returning None.
+    msg = SystemMessage(subtype="some_future_subtype", data={})
+    summary = _sdk_message_summary(msg)
+    assert "subtype=some_future_subtype" in summary
+
+
+def test_log_sdk_message_uses_generic_system_verb_for_unknown_subtype(caplog):
+    # SystemMessage with a subtype we don't promote keeps the generic `system`
+    # verb so the log line is still well-formed (verb + summary). The
+    # `subtype=` field is NOT stripped (it isn't redundant with the verb).
+    msg = SystemMessage(subtype="some_future_subtype", data={})
+    with caplog.at_level(_logging.INFO, logger="claude_dingtalk_bridge.claude_runner"):
+        _log_sdk_message(msg)
+    info_lines = [r.getMessage() for r in caplog.records if r.levelno == _logging.INFO]
+    assert any(l.startswith("system ") for l in info_lines)
+    assert any("subtype=some_future_subtype" in l for l in info_lines)
+
+
+def test_log_sdk_message_uses_typename_verb_for_unknown_message(caplog):
+    # A made-up SDK message type falls back to `<typename>.lower()` as the verb
+    # and `-` as the summary — keeps the log column structure intact instead
+    # of producing a malformed line.
+    class _FutureSDKMessage:
+        pass
+    with caplog.at_level(_logging.INFO, logger="claude_dingtalk_bridge.claude_runner"):
+        _log_sdk_message(_FutureSDKMessage())
+    info_lines = [r.getMessage() for r in caplog.records if r.levelno == _logging.INFO]
+    assert any(l.startswith("_futuresdkmessage ") for l in info_lines)
+
+
+def test_log_sdk_message_strips_subtype_exactly_when_summary_is_only_subtype(caplog):
+    # _strip_subtype_if_redundant covers two cases: prefix-strip (already
+    # tested via init), and exact-match (summary == "subtype=<x>") which
+    # should reduce to an empty summary. Construct a compact_boundary with
+    # nothing else to surface so its summary collapses to just `subtype=…`.
+    # That doesn't naturally happen for compact_boundary (it always renders
+    # pre_tokens/trigger too), so use a HookEventMessage whose hook_event_name
+    # alone matches its subtype — actually the cleanest reproducer is a
+    # SystemMessage with one of the known SUBTYPE_VERBS but empty data.
+    msg = SystemMessage(subtype="permission_denied", data={})
+    with caplog.at_level(_logging.INFO, logger="claude_dingtalk_bridge.claude_runner"):
+        _log_sdk_message(msg)
+    info_lines = [r.getMessage() for r in caplog.records if r.levelno == _logging.INFO]
+    # The verb already encodes the subtype; the trailing summary is empty.
+    matching = [l for l in info_lines if l.startswith("permission_denied")]
+    assert matching, info_lines
+    assert matching[0].rstrip() == "permission_denied"
+
+
+def test_summary_user_message_with_string_content_skips_iteration():
+    # UserMessage.content can be a plain string (no tool results, no text
+    # blocks) — the iteration is guarded by isinstance(list); the renderer
+    # still emits a line with no tool_results / text_preview.
+    msg = UserMessage(content="just a string")
+    summary = _sdk_message_summary(msg)
+    assert "tool_results=" not in summary
+    assert "text_preview=" not in summary
+
+
+def test_summary_user_message_text_blocks_render_combined_preview():
+    # UserMessage with TextBlock content (skill output / system reminder
+    # injections) — earlier versions rendered as a bare "-", losing the text.
+    msg = UserMessage(content=[TextBlock("hello"), TextBlock("world")])
+    summary = _sdk_message_summary(msg)
+    assert 'text_preview="hello world"' in summary
+    assert "text_len=10" in summary
+
+
+def test_summary_assistant_message_with_thinking_continues_loop_to_next_block():
+    # Branch coverage: ThinkingBlock followed by another block — the for loop
+    # must continue to the next iteration after handling the ThinkingBlock,
+    # not break out early.
+    msg = AssistantMessage(
+        content=[
+            ThinkingBlock(thinking="deliberating", signature="sig"),
+            TextBlock("done"),
+        ],
+        model="opus",
+    )
+    summary = _sdk_message_summary(msg)
+    # Both contributed: thinking_len carries the first block, text_preview the
+    # second.
+    assert "thinking_len=" in summary
+    assert 'text_preview="done"' in summary
+
+
+def test_summary_assistant_message_skips_unknown_block_types():
+    # ServerToolUseBlock (real SDK type) is not handled by the renderer — the
+    # for loop just skips it and moves to the next block rather than crashing.
+    # Forward-compat for future SDK block additions.
+    from claude_agent_sdk import ServerToolUseBlock
+    msg = AssistantMessage(
+        content=[
+            ServerToolUseBlock(id="srv_1", name="web_search", input={"q": "x"}),
+            TextBlock("after server tool"),
+        ],
+        model="opus",
+    )
+    summary = _sdk_message_summary(msg)
+    # The server tool block contributed nothing to the rendered fields —
+    # without tool_entries the renderer takes the pure-text shortcut and just
+    # emits the text. The point is the for loop didn't crash.
+    assert "ServerToolUseBlock" not in summary
+    assert "after server tool" in summary
+
+
+def test_summary_user_message_skips_unknown_block_types():
+    # Same forward-compat in UserMessage iteration.
+    from claude_agent_sdk import ServerToolResultBlock
+    msg = UserMessage(
+        content=[
+            ServerToolResultBlock(tool_use_id="srv_1", content="x"),
+            TextBlock("after server result"),
+        ],
+    )
+    summary = _sdk_message_summary(msg)
+    assert "ServerToolResultBlock" not in summary
+    assert 'text_preview="after server result"' in summary
+
+
+def test_cancel_drain_when_not_draining_is_noop():
+    # Documented no-op: callers (orchestrator) call cancel_drain() blindly
+    # whenever a new prompt arrives; if no drain is in flight it must just
+    # return rather than raising AttributeError.
+    runner = ClaudeRunner()
+    assert runner.is_draining is False
+    runner.cancel_drain()  # must not raise
+    assert runner.is_draining is False
+
+
+async def test_run_turn_logs_warning_when_disconnect_raises(monkeypatch, caplog):
+    # The teardown disconnect is wrapped in shield+wait_for+broad-except so a
+    # hung or buggy SDK disconnect can't pin the task or crash the daemon.
+    # When it does raise, we log a warning so the operator can see it
+    # rather than letting it disappear silently.
+    class _BadDisconnectClient(FakeSDKClient):
+        async def disconnect(self):
+            raise RuntimeError("disconnect blew up")
+
+    monkeypatch.setattr(cr_mod, "ClaudeSDKClient", _BadDisconnectClient)
+    FakeSDKClient.next_script = [_result_message()]
+    runner = ClaudeRunner()
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    with caplog.at_level(_logging.WARNING, logger="claude_dingtalk_bridge.claude_runner"):
+        await runner.run_turn("/tmp/p", "go", emit)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= _logging.WARNING]
+    assert any("disconnect did not complete cleanly" in m for m in warnings)
+
+
+async def test_drain_returns_silently_when_stream_ends(monkeypatch):
+    # If the SDK iterator exhausts mid-drain (StopAsyncIteration), the drain
+    # must return cleanly with no timeout event — the stream is just done.
+    from claude_agent_sdk import TaskStartedMessage
+    started = TaskStartedMessage(
+        subtype="task_started", data={"subagent_type": "general-purpose"},
+        task_id="t1", description="X", uuid="u", session_id="s",
+    )
+    # No HANG after the result — the iterator runs out as soon as drain
+    # tries to read the next message.
+    runner, events = await _run_turn_with(
+        monkeypatch,
+        [started, _result_message()],
+        timeout=5.0,
+        settle=0.05,
+    )
+    # Pending task without a notification — drain saw the iterator end,
+    # returned without fabricating a timeout event.
+    from claude_dingtalk_bridge.claude_runner import TaskEvent
+    assert not any(
+        isinstance(e, TaskEvent) and e.phase == "timeout" for e in events
+    )
+
+
+async def test_drain_returns_when_cancel_set_after_consume(monkeypatch):
+    # Race arm: cancel_drain() can land *during* a _consume() call (the
+    # consume itself has await points). After consume returns, drain checks
+    # _drain_cancel.is_set() and exits cleanly, even though the iterator
+    # would still yield more messages.
+    from claude_agent_sdk import TaskStartedMessage
+    from claude_dingtalk_bridge.claude_runner import TaskEvent
+
+    started = TaskStartedMessage(
+        subtype="task_started", data={"subagent_type": "general-purpose"},
+        task_id="t1", description="X", uuid="u", session_id="s",
+    )
+    # Trigger the cancel from inside the emit callback — that runs from
+    # _consume, so by the time consume returns the cancel flag is set.
+    monkeypatch.setattr(cr_mod, "ClaudeSDKClient", FakeSDKClient)
+    monkeypatch.setattr(cr_mod, "_STUCK_TIMEOUT", 5.0)
+    monkeypatch.setattr(cr_mod, "_SETTLE_TIMEOUT", 0.5)
+    # After the result message, queue a notification followed by HANG — the
+    # cancel must fire on the notification and prevent reading HANG.
+    from claude_agent_sdk import TaskNotificationMessage
+    notification = TaskNotificationMessage(
+        subtype="task_notification", data={},
+        task_id="t1", status="completed", output_file="/tmp/o",
+        summary="done", uuid="u2", session_id="s",
+        tool_use_id=None,
+    )
+    FakeSDKClient.next_script = [
+        started, _result_message(), notification, FakeSDKClient.HANG,
+    ]
+    runner = ClaudeRunner()
+    events: list = []
+
+    async def emit(event):
+        events.append(event)
+        # Once the notification lands in drain, fire cancel — the drain loop's
+        # post-consume cancel check then exits without reading HANG.
+        if isinstance(event, TaskEvent) and event.phase == "notification":
+            runner.cancel_drain()
+
+    await asyncio.wait_for(runner.run_turn("/tmp/p", "go", emit), timeout=2.0)
+    # No timeout event despite HANG being in the script — cancel won the race.
+    assert not any(
+        isinstance(e, TaskEvent) and e.phase == "timeout" for e in events
     )

@@ -1699,6 +1699,18 @@ def test_prompt_log_summary_hard_caps_at_300_when_no_boundary():
     assert out.endswith("…")
 
 
+def test_prompt_log_summary_no_boundary_under_hard_takes_full_text():
+    # Length between SOFT (80) and HARD (300) with no sentence boundary: the
+    # loop exhausts naturally (no break), `cut` stays None and falls back to
+    # min(len(text), HARD) = len(text), so the whole text is returned with
+    # no ellipsis.
+    from claude_dingtalk_bridge.orchestrator import _prompt_log_summary
+    text = "x" * 200  # 80 < 200 < 300, no boundary chars
+    out = _prompt_log_summary(text)
+    assert out == text
+    assert not out.endswith("…")
+
+
 def test_prompt_log_summary_handles_chinese_punctuation():
     from claude_dingtalk_bridge.orchestrator import _prompt_log_summary
     text = "短句一。" + "字" * 100 + "。后面还有"
@@ -1745,3 +1757,126 @@ async def test_cmd_stop_does_not_log_interrupt_when_idle(caplog):
         await orchestrator.handle_message("/stop", AUTHORIZED)
     lines = [r.getMessage() for r in caplog.records]
     assert not any("turn interrupted" in l for l in lines)
+
+
+# --- TaskEvent unknown-phase fallback ---------------------------------------
+
+
+async def test_emit_task_ignores_unknown_phase():
+    # If the runner ever emits a TaskEvent with a phase we don't know
+    # (forward-compat with future SDK additions) the orchestrator must
+    # not crash. The phone gets nothing, the pending sets are untouched.
+    from claude_dingtalk_bridge.claude_runner import TaskEvent
+    orchestrator, _runner, sent = build()
+    await orchestrator._emit_task(
+        TaskEvent("future_phase", "t1", description="x")
+    )
+    assert sent == []
+    assert orchestrator._pending_tasks == set()
+    assert orchestrator._acknowledged_tasks == set()
+
+
+async def test_emit_ignores_unknown_event_type():
+    # Forward-compat: if ClaudeRunner ever emits a new event type the
+    # orchestrator doesn't recognise, _emit falls through silently rather
+    # than crashing the turn.
+    orchestrator, _runner, sent = build()
+
+    class _FutureEvent:
+        pass
+
+    await orchestrator._emit(_FutureEvent())
+    assert sent == []
+
+
+async def test_cmd_prompt_queues_when_queued_prompt_takes_over_mid_cancel():
+    # Drain-cancel race: a fresh prompt arrives while the runner is draining
+    # background-agent waits. cancel_drain() + await frees the current task,
+    # but _run's finally already popped a queued prompt off the queue and
+    # started a new task before the await returned. We must NOT skip queueing
+    # this prompt — otherwise it would silently overlap the new task.
+    orchestrator, _runner, sent = build()
+
+    # Stage 1: an already-queued prompt that the runner will pop on finish.
+    drain_release = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def slow_first_turn(project_path, prompt, emit):
+        # Pretend to be in drain mode until cancel_drain is called.
+        await drain_release.wait()
+
+    async def slow_second_turn(project_path, prompt, emit):
+        # Block forever so the second task is "running" when _cmd_prompt
+        # checks self._task on the post-await line.
+        second_started.set()
+        await asyncio.Event().wait()
+
+    call_log = []
+
+    async def run_turn(project_path, prompt, emit):
+        call_log.append(prompt)
+        if len(call_log) == 1:
+            await slow_first_turn(project_path, prompt, emit)
+        else:
+            await slow_second_turn(project_path, prompt, emit)
+
+    _runner.run_turn = run_turn
+    # Pretend we entered drain mode for the first task.
+    _runner.is_draining = True
+
+    def cancel_drain():
+        # Releasing the await lets first_turn return, the finally block
+        # pops the queued prompt, and the second turn starts.
+        _runner.is_draining = False
+        drain_release.set()
+    _runner.cancel_drain = cancel_drain
+
+    # Kick off the first task and immediately enqueue a second prompt so
+    # _drain_queue has something to pop.
+    await orchestrator.handle_message("first", AUTHORIZED)
+    orchestrator._queue.append("queued-before-cancel")
+
+    # Now a fresh prompt arrives mid-drain — _cmd_prompt should:
+    #  1. Call cancel_drain → releases first turn
+    #  2. await self._task → finally drains queue, starts the queued prompt
+    #  3. See self._task is the NEW task (not None, not done)
+    #  4. Append THIS new prompt to the queue and send a queued notice
+    await orchestrator.handle_message("third", AUTHORIZED)
+    # The second task must have started.
+    await second_started.wait()
+    # And this new prompt was appended after the takeover.
+    assert "third" in orchestrator._queue
+    assert any("Task running — queued" in m for m in sent)
+
+    # Tidy up the still-running second task so the test fixture doesn't warn.
+    orchestrator._task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await orchestrator._task
+
+
+# --- _delayed_pending_notice race arms --------------------------------------
+
+
+async def test_delayed_pending_notice_no_op_after_cancellation():
+    # The notice timer is cancellable: if cancel lands during the sleep, the
+    # coroutine exits cleanly without sending. Direct call so we don't have
+    # to race the real timer.
+    orchestrator, _runner, sent = build()
+    task = asyncio.create_task(orchestrator._delayed_pending_notice())
+    await asyncio.sleep(0)  # let it enter the sleep
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert sent == []
+
+
+async def test_delayed_pending_notice_recheck_finds_nothing_after_sleep(monkeypatch):
+    # Recheck path: the timer fires, but by then every pending task has
+    # already been acknowledged. The notice is suppressed — otherwise we'd
+    # warn about agents the SDK already considers done.
+    monkeypatch.setattr(orch_mod, "_PENDING_NOTICE_DELAY", 0.01)
+    orchestrator, _runner, sent = build()
+    orchestrator._pending_tasks.add("t1")
+    orchestrator._acknowledged_tasks.add("t1")
+    await orchestrator._delayed_pending_notice()
+    assert not any("background agent" in m for m in sent)

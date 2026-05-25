@@ -778,7 +778,10 @@ def _strip_subtype_if_redundant(message, summary: str) -> str:
         prefix = f"subtype={sub} "
         if summary.startswith(prefix):
             return summary[len(prefix):]
-        if summary == f"subtype={sub}":
+        if summary == f"subtype={sub}":  # pragma: no branch
+            # False arm unreachable: when sub is set, summary always starts
+            # with `subtype=<sub> ` (matched above) or equals `subtype=<sub>`
+            # — the renderer never emits a summary without that prefix.
             return ""
     return summary
 

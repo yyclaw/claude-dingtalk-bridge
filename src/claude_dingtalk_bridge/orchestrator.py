@@ -331,7 +331,12 @@ class Orchestrator:
             # Wait for the turn to fully unwind (disconnect, drain teardown)
             # before confirming — unless a queued prompt took over, which
             # already announced itself.
-            if task is not None:
+            if task is not None:  # pragma: no branch
+                # False arm unreachable today: _abort_running_task returns
+                # True only when self._task was set, and `task` was captured
+                # from self._task without an intervening await. Kept as a
+                # safety net for future reorderings that could insert an
+                # await between the capture and abort.
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             if self._task is None:

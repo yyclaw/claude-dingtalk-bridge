@@ -45,7 +45,9 @@ def _dispatch(args: argparse.Namespace) -> int:
         print("Restarted.")
     elif args.command == "status":
         print(launchd.status())
-    elif args.command == "uninstall":
+    elif args.command == "uninstall":  # pragma: no branch
+        # Argparse's `required=True` rules out any other command value,
+        # so the implicit False arm of this elif is unreachable.
         launchd.uninstall()
         print("Uninstalled.")
     return 0

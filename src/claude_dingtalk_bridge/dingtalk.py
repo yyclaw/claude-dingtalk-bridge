@@ -52,7 +52,10 @@ class DingTalkTransport:
         # One transparent retry on 401: DingTalk can revoke a token early
         # (rotation, manual invalidation) and the cached value would otherwise
         # stay stale until natural expiry — wedging every phone-bound message.
-        for attempt in (1, 2):
+        for attempt in (1, 2):  # pragma: no branch
+            # Natural-exit arm unreachable: each iteration either `continue`s
+            # (401 + first attempt) or `return`s after raise_for_status, so
+            # the loop never falls through.
             headers = {
                 "Content-Type": "application/json",
                 "x-acs-dingtalk-access-token": self._access_token(),

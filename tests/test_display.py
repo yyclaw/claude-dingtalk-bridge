@@ -82,3 +82,18 @@ def test_collapse_inline_paths_noop_when_no_cwd_and_path_outside_home():
 
 def test_collapse_inline_paths_empty_string_unchanged():
     assert collapse_inline_paths("") == ""
+
+
+def test_collapse_home_guards_against_empty_or_root_home(monkeypatch):
+    # If $HOME ever resolves to "" (no pwd entry + no env var) the naive
+    # `s.replace(_HOME + "/", "~/")` would replace EVERY `/` in the string
+    # with `~/` — turning `/tmp/x` into `~/tmp~/x`. Same risk if HOME == "/"
+    # (running as root with HOME=/): `_HOME + "/"` becomes `//` and would
+    # collapse double-slashes. Guard at the helper, not just at config time.
+    import claude_dingtalk_bridge.display as display_mod
+
+    monkeypatch.setattr(display_mod, "_HOME", "")
+    assert display_mod._collapse_home("/tmp/x") == "/tmp/x"
+
+    monkeypatch.setattr(display_mod, "_HOME", "/")
+    assert display_mod._collapse_home("/tmp/x") == "/tmp/x"

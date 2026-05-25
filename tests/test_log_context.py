@@ -81,6 +81,73 @@ def test_clear_resets_cwd_too():
     assert _in_fresh_context(go) == ""
 
 
+def test_record_tool_use_lazy_inits_map_in_fresh_context():
+    # The autouse conftest fixture pre-runs log_context.clear(), which sets
+    # _tool_uses to {} — so copy_context() would inherit that. Use an empty
+    # contextvars.Context() to start from the ContextVar's None default, so
+    # the lazy-init path in _tool_use_map() actually fires.
+    def go():
+        log_context.record_tool_use("toolu_abc", "Read")
+        name, elapsed = log_context.take_tool_use("toolu_abc")
+        return name, elapsed
+
+    name, elapsed = contextvars.Context().run(go)
+    assert name == "Read"
+    assert elapsed is not None and elapsed >= 0
+
+
+def test_record_tool_use_ignores_empty_id():
+    def go():
+        log_context.record_tool_use("", "Read")
+        # Empty id wasn't stored; take with empty id also no-ops.
+        return log_context.take_tool_use("")
+
+    assert _in_fresh_context(go) == (None, None)
+
+
+def test_take_tool_use_returns_none_for_unknown_id():
+    def go():
+        return log_context.take_tool_use("toolu_never_recorded")
+
+    assert _in_fresh_context(go) == (None, None)
+
+
+def test_record_subagent_lazy_inits_map_in_fresh_context():
+    # Same lazy-init coverage for the subagent map. Must start from a fully
+    # empty Context() — see the tool_use lazy-init test for the reason.
+    def go():
+        log_context.record_subagent("toolu_x", "abcd1234efgh", "Explore")
+        return log_context.lookup_subagent("toolu_x")
+
+    sub_id, sub_type = contextvars.Context().run(go)
+    assert sub_type == "Explore"
+    assert sub_id == "abcd1234"
+
+
+def test_record_subagent_skipped_without_type_or_id():
+    def go():
+        log_context.record_subagent("", "tid", "Explore")
+        log_context.record_subagent("toolu_y", "tid", None)
+        return (
+            log_context.lookup_subagent(""),
+            log_context.lookup_subagent("toolu_y"),
+        )
+
+    empty, missing_type = _in_fresh_context(go)
+    assert empty == (None, None)
+    assert missing_type == (None, None)
+
+
+def test_forget_subagent_handles_missing_id():
+    # Bare forget on an unknown id is a no-op (and the empty-id early return).
+    def go():
+        log_context.forget_subagent(None)
+        log_context.forget_subagent("toolu_unknown")
+        return log_context.lookup_subagent("toolu_unknown")
+
+    assert _in_fresh_context(go) == (None, None)
+
+
 class _PrefixFormatter(logging.Formatter):
     """Mirror of daemon._ShortNameFormatter's session/turn prefix logic, kept
     here so the test is independent of daemon's full wiring."""

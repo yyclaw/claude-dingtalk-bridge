@@ -518,3 +518,94 @@ async def test_chat_handler_richtext_drops_non_text_non_image_items():
     prompt, sender = orch.images[0]
     assert sender == "staff-1"
     assert "[image saved at /tmp/img/a.png]" in prompt
+
+
+def test_run_tolerates_stream_reconfigure_failures(monkeypatch):
+    # pytest captures stdout/stderr as wrappers that may not support
+    # reconfigure() (or may be closed). run() must tolerate either AttributeError
+    # or OSError rather than crashing the daemon at boot.
+    import sys
+
+    _patch_run(monkeypatch)
+
+    class _BadStream:
+        def reconfigure(self, **_kwargs):
+            raise OSError("not a TextIOWrapper")
+
+        # Need write/flush so logging handlers attached later don't crash.
+        def write(self, *_a, **_k):
+            return 0
+
+        def flush(self):
+            pass
+
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdout", _BadStream())
+    monkeypatch.setattr(sys, "stderr", _BadStream())
+
+    async def fake_serve(client, orchestrator):
+        return
+
+    monkeypatch.setattr(daemon, "_serve", fake_serve)
+    daemon.run()  # must not raise
+
+
+async def test_drive_stream_client_returns_on_cancel_during_reconnect_sleep(
+    monkeypatch,
+):
+    # The reconnect loop sleeps between attempts; cancelling the task while
+    # the sleep is in flight must exit cleanly (no warning, no re-raise).
+    # Use a non-zero delay so the cancel reliably lands on the sleep, not on
+    # client.start().
+    monkeypatch.setattr(daemon, "_RECONNECT_DELAY", 5.0)
+
+    class _AlwaysFailingClient:
+        async def start(self):
+            raise RuntimeError("blip")
+
+    task = asyncio.create_task(daemon._drive_stream_client(_AlwaysFailingClient()))
+    # Yield enough times for start() to fail and the sleep to begin.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    task.cancel()
+    # The handler swallows CancelledError and returns normally — no exception
+    # should propagate out of `await task`.
+    await task
+
+
+async def test_serve_tolerates_missing_signal_handler_support(monkeypatch):
+    # Some loops (Windows, sub-thread loops, etc.) reject add_signal_handler
+    # with NotImplementedError / RuntimeError. _serve must fall through to
+    # default signal semantics rather than crashing at startup.
+    class _Loop:
+        def add_signal_handler(self, sig, cb):
+            raise NotImplementedError("not supported on this loop")
+
+    real_get = asyncio.get_running_loop
+
+    def fake_get_loop():
+        # The real loop is needed for the rest of _serve (Event, create_task);
+        # return a wrapper that only overrides add_signal_handler.
+        real = real_get()
+
+        class _Wrapper:
+            def __getattr__(self, name):
+                if name == "add_signal_handler":
+                    raise NotImplementedError("not supported")
+                return getattr(real, name)
+
+        return _Wrapper()
+
+    monkeypatch.setattr(asyncio, "get_running_loop", fake_get_loop)
+    client = _FakeStreamClient(credential=None)
+    orch = _StubOrchestrator()
+    serve_task = asyncio.create_task(daemon._serve(client, orch))
+    await asyncio.sleep(0)
+    serve_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await serve_task
+    # _serve still wired the rest of the lifecycle even though signal handlers
+    # couldn't be installed.
+    assert orch.shutdown_called == 1

@@ -218,6 +218,19 @@ def test_restart_kickstarts_with_kill_flag():
     assert run.call_args[0][0] == ["launchctl", "kickstart", "-k", launchd._service_target()]
 
 
+def test_restart_falls_back_to_start_when_not_loaded():
+    # restart() shouldn't fail with "not loaded" — it should just delegate to
+    # start() (bootstrap), since restarting an unloaded service is morally a
+    # cold start. Otherwise the CLI's `daemon-restart` would error
+    # post-install before any `daemon-start`.
+    with patch.object(launchd, "_is_loaded", return_value=False), \
+         patch.object(launchd, "start") as start, \
+         patch.object(launchd, "_run") as run:
+        launchd.restart()
+    start.assert_called_once_with()
+    run.assert_not_called()
+
+
 def test_status_reports_not_installed_when_helper_absent(tmp_path, monkeypatch):
     monkeypatch.setattr(launchd, "_helper_path", lambda: tmp_path / "missing")
     assert launchd.status() == "not installed"
