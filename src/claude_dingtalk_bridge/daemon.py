@@ -42,23 +42,37 @@ def _disable_websocket_proxy() -> None:
     websockets.connect = connect
 
 
-def _silence_cancellederror_noise() -> None:
-    """Drop the misleading ERROR ``dingtalk_stream.client`` emits on shutdown.
+def _filter_client_noise() -> None:
+    """Tame the ``dingtalk_stream.client`` SDK logger.
 
-    The SDK's ``start()`` loop catches ``asyncio.CancelledError`` in the same
-    ``except`` as real network errors and logs it via ``logger.error(fmt, e)``,
-    making a clean shutdown look like a network failure. We can't tell from
-    the format string alone, but the exception object itself is the first
-    positional logging argument -- match on its type so we don't depend on the
-    SDK's wording and won't silently break if the message text changes.
+    The SDK calls ``logger.error()`` for two categories of event we don't
+    want surfaced at ERROR level:
+
+    * Clean shutdown: ``start()`` catches ``asyncio.CancelledError`` in the
+      same ``except`` as real network errors. The exception is the first
+      positional arg, so we match on its type (not the format string) and
+      drop the record.
+    * Auto-reconnect events (``[start] network exception``,
+      ``open connection failed``): the SDK reconnects within seconds, so
+      ERROR is alarmist. But they do signal an outage, so they belong in
+      err.log (not out.log, which is for normal operational chatter) —
+      downgrade to WARNING.
     """
+
+    reconnect_hints = ("network exception", "open connection failed")
 
     class _Filter(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
             args = record.args
-            if not isinstance(args, tuple) or not args:
-                return True
-            return not isinstance(args[0], asyncio.CancelledError)
+            if isinstance(args, tuple) and args and isinstance(
+                args[0], asyncio.CancelledError
+            ):
+                return False
+            if record.levelno >= logging.ERROR and isinstance(record.msg, str):
+                if any(hint in record.msg for hint in reconnect_hints):
+                    record.levelno = logging.WARNING
+                    record.levelname = "WARNING"
+            return True
 
     logging.getLogger("dingtalk_stream.client").addFilter(_Filter())
 
@@ -315,7 +329,7 @@ def run() -> None:
     logging.getLogger(
         "claude_agent_sdk._internal.transport.subprocess_cli"
     ).setLevel(logging.WARNING)
-    _silence_cancellederror_noise()
+    _filter_client_noise()
     config = load_config()
     _disable_websocket_proxy()
     orchestrator, _ = build_orchestrator(config)

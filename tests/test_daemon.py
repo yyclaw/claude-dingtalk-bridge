@@ -8,7 +8,7 @@ from claude_dingtalk_bridge.daemon import (
     _ChatHandler,
     _disable_websocket_proxy,
     _mask_sender,
-    _silence_cancellederror_noise,
+    _filter_client_noise,
     build_image_prompt,
     build_orchestrator,
 )
@@ -469,37 +469,40 @@ async def test_serve_survives_shutdown_failure():
     assert orch.shutdown_called == 1
 
 
-def test_silence_cancellederror_noise_drops_cancellederror_records():
+def test_filter_client_noise_drops_and_downgrades():
     import logging as _logging
 
-    _silence_cancellederror_noise()
+    _filter_client_noise()
     sdk_logger = _logging.getLogger("dingtalk_stream.client")
-    captured: list[str] = []
+    captured: list[tuple[int, str]] = []
 
     class _Capture(_logging.Handler):
         def emit(self, record):
-            captured.append(record.getMessage())
+            captured.append((record.levelno, record.getMessage()))
 
     handler = _Capture(level=_logging.DEBUG)
     sdk_logger.addHandler(handler)
     sdk_logger.setLevel(_logging.DEBUG)
     try:
-        # Shutdown path: the SDK passes the CancelledError object as the arg --
-        # filter drops it regardless of the format string the SDK happens to use.
+        # Shutdown path: CancelledError is the first arg -- dropped regardless
+        # of the format string the SDK happens to use.
         sdk_logger.error("[start] network exception, error=%s", asyncio.CancelledError())
         sdk_logger.error("anything at all, error=%s", asyncio.CancelledError())
-        # Real network error: arg is a different exception -> passes through.
+        # Auto-reconnect events: kept but downgraded ERROR -> WARNING so they
+        # stay in err.log (where outage signals belong) and out of out.log.
         sdk_logger.error(
             "[start] network exception, error=%s",
             ConnectionResetError("peer reset"),
         )
-        # No-arg log line: passes through.
         sdk_logger.error("open connection failed")
+        # Unrelated ERROR: passes through untouched.
+        sdk_logger.error("token refresh failed")
     finally:
         sdk_logger.removeHandler(handler)
     assert captured == [
-        "[start] network exception, error=peer reset",
-        "open connection failed",
+        (_logging.WARNING, "[start] network exception, error=peer reset"),
+        (_logging.WARNING, "open connection failed"),
+        (_logging.ERROR, "token refresh failed"),
     ]
 
 

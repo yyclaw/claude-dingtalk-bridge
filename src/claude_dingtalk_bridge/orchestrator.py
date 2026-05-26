@@ -879,7 +879,7 @@ class Orchestrator:
                 )
                 return allowed
             except asyncio.TimeoutError:
-                logger.warning(
+                logger.info(
                     "permission timeout tool=%s waited=%.1fs result=denied",
                     tool_name, loop.time() - start,
                 )
@@ -917,7 +917,7 @@ class Orchestrator:
                 )
                 reply = await self._ask_one(question, idx, len(questions), options)
                 if reply is None:
-                    logger.warning(
+                    logger.info(
                         "ask_user_question cancelled idx=%d/%d waited=%.1fs",
                         idx + 1, len(questions), loop.time() - start,
                     )

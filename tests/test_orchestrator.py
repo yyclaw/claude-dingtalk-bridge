@@ -1547,7 +1547,7 @@ async def test_request_permission_logs_timeout(caplog, monkeypatch):
     orchestrator, _runner, _sent = build()
     # Squash the long default timeout so the test doesn't actually wait.
     monkeypatch.setattr(orchestrator._config, "permission_timeout_seconds", 0.05)
-    with caplog.at_level(logging.WARNING, logger="claude_dingtalk_bridge.orchestrator"):
+    with caplog.at_level(logging.INFO, logger="claude_dingtalk_bridge.orchestrator"):
         result = await orchestrator.request_permission(
             "Bash", {"command": "rm -rf /tmp/x"}, "/tmp/multica",
         )
