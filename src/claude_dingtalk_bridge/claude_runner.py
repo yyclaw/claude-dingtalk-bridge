@@ -1106,7 +1106,13 @@ class ClaudeRunner:
             kwargs["model"] = self._model
         # Force the 1-hour prompt cache TTL — phone turns are minutes apart,
         # so the default 5-minute window is almost always cold.
-        env = {"ENABLE_PROMPT_CACHING_1H": "1"}
+        # Override the SDK's default "sdk-py" entrypoint so daemon-produced
+        # sessions show up in the desktop TUI's /resume picker (which hides
+        # sdk-py / sdk-cli sessions).
+        env = {
+            "ENABLE_PROMPT_CACHING_1H": "1",
+            "CLAUDE_CODE_ENTRYPOINT": "claude-dingtalk-bridge",
+        }
         if self.proxy_url:
             env.update(
                 {

@@ -242,7 +242,10 @@ def test_tool_summary_collapses_paths_inside_grep_pattern_in_path():
 def test_build_options_enables_1h_cache_without_proxy():
     runner = ClaudeRunner()
     options = runner._build_options("/tmp/proj")
-    assert options.env == {"ENABLE_PROMPT_CACHING_1H": "1"}
+    assert options.env == {
+        "ENABLE_PROMPT_CACHING_1H": "1",
+        "CLAUDE_CODE_ENTRYPOINT": "claude-dingtalk-bridge",
+    }
 
 
 def test_build_options_injects_proxy_env_alongside_cache():
@@ -255,6 +258,7 @@ def test_build_options_injects_proxy_env_alongside_cache():
         "HTTP_PROXY": "http://127.0.0.1:8118",
         "HTTPS_PROXY": "http://127.0.0.1:8118",
         "ENABLE_PROMPT_CACHING_1H": "1",
+        "CLAUDE_CODE_ENTRYPOINT": "claude-dingtalk-bridge",
     }
 
 
