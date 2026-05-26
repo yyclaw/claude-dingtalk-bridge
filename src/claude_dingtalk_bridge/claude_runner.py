@@ -276,6 +276,26 @@ def _middle_elide(text: str, limit: int) -> str:
     return f"{text[:head]}…{text[-tail:]}"
 
 
+def _ask_question_status(content) -> str:
+    """Resolve the real outcome of an AskUserQuestion ToolResultBlock.
+
+    The SDK has no "answered with a value" callback shape — orchestrator.
+    answer_question() returns the user's reply via PermissionResultDeny,
+    so `is_error` is always True. The actual disposition is encoded in the
+    message text written by answer_question; match its known prefixes to
+    decide between ``answered`` and ``no_answer``.
+    """
+    raw = content
+    if isinstance(raw, list):
+        raw = " ".join(
+            part.get("text", "") for part in raw if isinstance(part, dict)
+        )
+    flat = str(raw or "")
+    if flat.startswith("The user answered"):
+        return "answered"
+    return "no_answer"
+
+
 def _tool_result_preview(content, *, collapse: bool, limit: int = 80) -> tuple[str, int]:
     """Flatten a ToolResultBlock.content value into a single preview + total len.
 
@@ -604,6 +624,13 @@ def _sdk_message_summary(message) -> str | None:
                     prefix = f"{tool_name}#{short_id}" if tool_name else short_id
                     dur_str = _format_elapsed(elapsed) if elapsed is not None else None
                     flag = "err" if b.is_error else "done"
+                    if tool_name == "AskUserQuestion":
+                        # SDK convention: AskUserQuestion is delivered as
+                        # PermissionResultDeny so `is_error` is always True —
+                        # the actual outcome (user answered vs. cancelled /
+                        # timed out) lives in the message text. Resolve it
+                        # here so downstream log readers don't have to.
+                        flag = _ask_question_status(b.content)
                     flag_with_dur = f"{flag} {dur_str}" if dur_str else flag
                     # Two distinct reasons to surface tool_result content:
                     #   - errors: `(err)` on its own forces a JSONL dive to

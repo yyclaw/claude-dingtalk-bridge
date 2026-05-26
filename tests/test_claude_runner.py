@@ -1079,6 +1079,76 @@ def test_summary_user_message_tool_results_error_includes_name_and_duration():
     assert re.search(r"Bash#01abc\(err \d+(ms|\.\d+s): command not found\)", summary), summary
 
 
+def test_summary_ask_user_question_answered_renders_as_answered_not_err():
+    # SDK convention: AskUserQuestion always comes back as PermissionResultDeny
+    # so is_error=True. The flag must reflect the real outcome (user answered)
+    # rather than blindly say `err` like every other deny.
+    use = AssistantMessage(
+        content=[ToolUseBlock(
+            id="toolu_01ABCDEF", name="AskUserQuestion",
+            input={"questions": [{"question": "name?"}]},
+        )],
+        model="opus",
+    )
+    _ = _sdk_message_summary(use)
+    result = UserMessage(content=[
+        ToolResultBlock(
+            tool_use_id="toolu_01ABCDEF",
+            content="The user answered your AskUserQuestion via DingTalk: ...",
+            is_error=True,
+        ),
+    ])
+    summary = _sdk_message_summary(result)
+    assert "AskUserQuestion#01ABCDEF(answered" in summary
+    assert "AskUserQuestion#01ABCDEF(err" not in summary
+
+
+def test_ask_question_status_handles_list_content():
+    # Newer SDK wire-format delivers PermissionResultDeny.message as a list
+    # of {type:"text",text:"…"} parts rather than a bare string. The helper
+    # concatenates the text fields before matching the answered/no_answer
+    # prefix.
+    from claude_dingtalk_bridge.claude_runner import _ask_question_status
+
+    answered = _ask_question_status([
+        {"type": "text", "text": "The user answered your AskUserQuestion"},
+        {"type": "text", "text": " via DingTalk: - foo: bar"},
+    ])
+    assert answered == "answered"
+    no_answer = _ask_question_status([
+        {"type": "text", "text": "The user did not answer your AskUserQuestion"},
+    ])
+    assert no_answer == "no_answer"
+    # None/empty content also falls into the safe "no_answer" branch — the
+    # daemon shouldn't crash if the SDK ever delivers an empty list.
+    assert _ask_question_status(None) == "no_answer"
+    assert _ask_question_status([]) == "no_answer"
+
+
+def test_summary_ask_user_question_no_answer_renders_as_no_answer():
+    # Cancelled/timed-out variant: orchestrator returns a "did not answer"
+    # message via PermissionResultDeny — flag should be `no_answer`.
+    use = AssistantMessage(
+        content=[ToolUseBlock(
+            id="toolu_01ABCDEF", name="AskUserQuestion",
+            input={"questions": [{"question": "name?"}]},
+        )],
+        model="opus",
+    )
+    _ = _sdk_message_summary(use)
+    result = UserMessage(content=[
+        ToolResultBlock(
+            tool_use_id="toolu_01ABCDEF",
+            content="The user did not answer your AskUserQuestion via DingTalk "
+                    "(cancelled or timed out). Do not retry; proceed with a "
+                    "reasonable default.",
+            is_error=True,
+        ),
+    ])
+    summary = _sdk_message_summary(result)
+    assert "AskUserQuestion#01ABCDEF(no_answer" in summary
+
+
 def test_summary_user_message_error_with_list_content_extracts_text_parts():
     # When SDK delivers tool errors as a list of {type, text} parts, the
     # preview must concatenate the text fields rather than render the raw
