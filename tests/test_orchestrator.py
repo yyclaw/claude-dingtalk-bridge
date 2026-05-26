@@ -60,6 +60,8 @@ class FakeRunner:
         self.sessions: dict[str, str] = {}
         self.token_totals: dict[str, int] = {}
         self.usages: dict[str, dict] = {}
+        self.model_token_totals: dict[str, dict[str, int]] = {}
+        self.model_usages: dict[str, dict] = {}
         self.model_override = None
         self.observed_model = None
         self.is_draining = False
@@ -92,6 +94,12 @@ class FakeRunner:
 
     def last_usage(self, project_path: str) -> dict | None:
         return self.usages.get(project_path)
+
+    def session_model_tokens(self, project_path: str) -> dict[str, int]:
+        return dict(self.model_token_totals.get(project_path, {}))
+
+    def last_model_usage(self, project_path: str) -> dict | None:
+        return self.model_usages.get(project_path)
 
     async def interrupt(self) -> None:
         self.interrupts += 1
@@ -814,11 +822,11 @@ def test_format_tokens_millions():
     assert format_tokens(12_300_000) == "12.3M"
 
 
-async def test_status_with_no_turns_shows_zero_tokens():
+async def test_status_with_no_turns_omits_session_tokens():
     orchestrator, runner, sent = build()
     await orchestrator.handle_message("/status", AUTHORIZED)
     msg = "\n".join(sent)
-    assert "**Session tokens:** 0" in msg
+    assert "Session tokens" not in msg
     assert "Cache" not in msg
 
 
@@ -837,6 +845,58 @@ async def test_status_shows_session_tokens_and_cache():
     msg = "\n".join(sent)
     assert "**Session tokens:** 1.2M" in msg
     assert "**Cache last turn:** read 45K (hit 84.9%) · creation 8K" in msg
+
+
+async def test_status_shows_per_model_breakdown():
+    runner = FakeRunner()
+    runner.token_totals["/tmp/multica"] = 1_200_000
+    runner.model_token_totals["/tmp/multica"] = {
+        "claude-opus-4-7[1m]": 900_000,
+        "claude-haiku-4-5-20251001": 300_000,
+    }
+    runner.usages["/tmp/multica"] = {
+        "cache_read_input_tokens": 45000,
+        "cache_creation": {
+            "ephemeral_1h_input_tokens": 8000,
+            "ephemeral_5m_input_tokens": 0,
+        },
+    }
+    runner.model_usages["/tmp/multica"] = {
+        "claude-opus-4-7[1m]": {
+            "inputTokens": 100, "outputTokens": 1500,
+            "cacheReadInputTokens": 45000, "cacheCreationInputTokens": 7000,
+        },
+        "claude-haiku-4-5-20251001": {
+            "inputTokens": 50, "outputTokens": 200,
+            "cacheReadInputTokens": 0, "cacheCreationInputTokens": 1000,
+        },
+    }
+    orchestrator, runner, sent = build(runner)
+    await orchestrator.handle_message("/status", AUTHORIZED)
+    msg = "\n".join(sent)
+    assert "**Session tokens:** 1.2M" in msg
+    assert "  - opus-4.7[1m]: 900K" in msg
+    assert "  - haiku-4.5: 300K" in msg
+    assert "**Cache last turn:** read 45K (hit 84.7%) · creation 8K" in msg
+    assert "  - opus-4.7[1m]: read 45K (hit 86.4%) · creation 7K" in msg
+    assert "  - haiku-4.5: read 0 (hit 0.0%) · creation 1K" in msg
+
+
+async def test_status_single_model_omits_breakdown():
+    runner = FakeRunner()
+    runner.token_totals["/tmp/multica"] = 1000
+    runner.model_token_totals["/tmp/multica"] = {"claude-opus-4-7": 1000}
+    runner.usages["/tmp/multica"] = {"cache_read_input_tokens": 100}
+    runner.model_usages["/tmp/multica"] = {
+        "claude-opus-4-7": {
+            "inputTokens": 5, "outputTokens": 5,
+            "cacheReadInputTokens": 100, "cacheCreationInputTokens": 50,
+        },
+    }
+    orchestrator, runner, sent = build(runner)
+    await orchestrator.handle_message("/status", AUTHORIZED)
+    msg = "\n".join(sent)
+    assert "  - opus-4.7" not in msg
 
 
 async def test_model_no_arg_lists_models():

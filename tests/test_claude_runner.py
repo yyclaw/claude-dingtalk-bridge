@@ -385,6 +385,117 @@ def test_set_session_resets_token_tally():
     assert runner.session_tokens("/p") == 0
 
 
+def test_record_usage_accumulates_per_model_tokens():
+    runner = ClaudeRunner()
+    runner.record_usage(
+        "/p",
+        {
+            "input_tokens": 100, "output_tokens": 50,
+            "cache_read_input_tokens": 800, "cache_creation_input_tokens": 200,
+        },
+        model_usage={
+            "claude-opus-4-7": {
+                "inputTokens": 70, "outputTokens": 40,
+                "cacheReadInputTokens": 800, "cacheCreationInputTokens": 200,
+            },
+            "claude-haiku-4-5": {
+                "inputTokens": 30, "outputTokens": 10,
+                "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+            },
+        },
+    )
+    assert runner.session_model_tokens("/p") == {
+        "claude-opus-4-7": 1110,
+        "claude-haiku-4-5": 40,
+    }
+    runner.record_usage(
+        "/p", {"input_tokens": 10},
+        model_usage={
+            "claude-opus-4-7": {
+                "inputTokens": 10, "outputTokens": 0,
+                "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+            },
+        },
+    )
+    assert runner.session_model_tokens("/p") == {
+        "claude-opus-4-7": 1120,
+        "claude-haiku-4-5": 40,
+    }
+
+
+def test_record_usage_session_total_sums_model_usage_when_present():
+    # usage carries only the main agent's totals; model_usage is the only
+    # source for subagent tokens. So session_tokens must follow model_usage
+    # when it's available, otherwise subagent cost vanishes from /status.
+    runner = ClaudeRunner()
+    runner.record_usage(
+        "/p",
+        {"input_tokens": 7, "output_tokens": 200,
+         "cache_read_input_tokens": 50000, "cache_creation_input_tokens": 7000},
+        model_usage={
+            "claude-opus-4-7": {
+                "inputTokens": 7, "outputTokens": 200,
+                "cacheReadInputTokens": 50000, "cacheCreationInputTokens": 7000,
+            },
+            "claude-haiku-4-5": {
+                "inputTokens": 3, "outputTokens": 4,
+                "cacheReadInputTokens": 20000, "cacheCreationInputTokens": 2000,
+            },
+        },
+    )
+    assert runner.session_tokens("/p") == 57207 + 22007
+
+
+def test_record_usage_stores_last_model_usage():
+    runner = ClaudeRunner()
+    mu = {"claude-opus-4-7": {"inputTokens": 1, "outputTokens": 0,
+        "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}
+    runner.record_usage("/p", {"input_tokens": 1}, model_usage=mu)
+    assert runner.last_model_usage("/p") == mu
+
+
+def test_session_model_tokens_defaults_to_empty():
+    runner = ClaudeRunner()
+    assert runner.session_model_tokens("/p") == {}
+    assert runner.last_model_usage("/p") is None
+
+
+def test_record_usage_without_model_usage_leaves_per_model_empty():
+    runner = ClaudeRunner()
+    runner.record_usage("/p", {"input_tokens": 100})
+    assert runner.session_tokens("/p") == 100
+    assert runner.session_model_tokens("/p") == {}
+    assert runner.last_model_usage("/p") is None
+
+
+def test_reset_clears_per_model_state():
+    runner = ClaudeRunner()
+    runner.record_usage(
+        "/p", {"input_tokens": 100},
+        model_usage={"claude-opus-4-7": {
+            "inputTokens": 100, "outputTokens": 0,
+            "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+        }},
+    )
+    runner.reset("/p")
+    assert runner.session_model_tokens("/p") == {}
+    assert runner.last_model_usage("/p") is None
+
+
+def test_set_session_clears_per_model_state():
+    runner = ClaudeRunner()
+    runner.record_usage(
+        "/p", {"input_tokens": 100},
+        model_usage={"claude-opus-4-7": {
+            "inputTokens": 100, "outputTokens": 0,
+            "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+        }},
+    )
+    runner.set_session("/p", "new-id")
+    assert runner.session_model_tokens("/p") == {}
+    assert runner.last_model_usage("/p") is None
+
+
 def test_translate_compact_boundary_emits_text():
     from claude_agent_sdk import SystemMessage
 

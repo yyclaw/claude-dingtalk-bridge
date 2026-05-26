@@ -89,6 +89,25 @@ def _cache_breakdown(usage: dict) -> dict:
     }
 
 
+def _model_cache_breakdown(entry: dict) -> dict:
+    """Pull cache numbers off a single model_usage entry.
+
+    Mirrors ``_cache_breakdown`` but consumes the camelCase shape the SDK
+    uses on ``ResultMessage.model_usage`` entries — and without the 1h/5m
+    creation split, which model_usage does not carry.
+    """
+    read = entry.get("cacheReadInputTokens", 0)
+    creation = entry.get("cacheCreationInputTokens", 0)
+    input_t = entry.get("inputTokens", 0)
+    prompt_total = read + creation + input_t
+    hit = f"{read * 100 / prompt_total:.1f}%" if prompt_total else "n/a"
+    return {
+        "read": format_tokens(read),
+        "creation": format_tokens(creation),
+        "hit": hit,
+    }
+
+
 def _log_cache_usage(usage: dict | None) -> None:
     """Log the per-turn prompt-cache token breakdown.
 
@@ -1005,6 +1024,11 @@ class ClaudeRunner:
         # both scoped to the current session (cleared on reset/switch).
         self._session_tokens: dict[str, int] = {}
         self._last_usage: dict[str, dict] = {}
+        # Same scope, but split per model (main + subagents). The SDK reports
+        # this on ResultMessage.model_usage with camelCase keys distinct from
+        # `usage`. Empty when a turn has no model_usage payload.
+        self._session_model_tokens: dict[str, dict[str, int]] = {}
+        self._last_model_usage: dict[str, dict] = {}
         # Per-project monotonic turn id, scoped to the current session so the
         # count restarts at 1 whenever the session is cleared or switched.
         # Surfaced via log_context for grep-by-session-and-turn slicing.
@@ -1018,6 +1042,8 @@ class ClaudeRunner:
         self._session_ids.pop(project_path, None)
         self._session_tokens.pop(project_path, None)
         self._last_usage.pop(project_path, None)
+        self._session_model_tokens.pop(project_path, None)
+        self._last_model_usage.pop(project_path, None)
         self._turn_counts.pop(project_path, None)
 
     def set_session(self, project_path: str, session_id: str) -> None:
@@ -1026,6 +1052,8 @@ class ClaudeRunner:
         # tally so /status reflects the resumed session, not the old one.
         self._session_tokens.pop(project_path, None)
         self._last_usage.pop(project_path, None)
+        self._session_model_tokens.pop(project_path, None)
+        self._last_model_usage.pop(project_path, None)
         self._turn_counts.pop(project_path, None)
 
     def next_turn(self, project_path: str) -> int:
@@ -1044,6 +1072,17 @@ class ClaudeRunner:
     def last_usage(self, project_path: str) -> dict | None:
         """Raw usage dict from the project's most recent turn, if any."""
         return self._last_usage.get(project_path)
+
+    def session_model_tokens(self, project_path: str) -> dict[str, int]:
+        """Cumulative tokens for the current session, split per model.
+
+        Empty when no turn yet carried a model_usage payload.
+        """
+        return dict(self._session_model_tokens.get(project_path, {}))
+
+    def last_model_usage(self, project_path: str) -> dict | None:
+        """Raw model_usage dict from the project's most recent turn, if any."""
+        return self._last_model_usage.get(project_path)
 
     def set_model(self, model: str | None) -> None:
         """Set (or clear, if None) the model override applied to subsequent turns."""
@@ -1087,19 +1126,47 @@ class ClaudeRunner:
                 log_context.set_session(session_id)
                 self._session_ids[project_path] = session_id
 
-    def record_usage(self, project_path: str, usage: dict | None) -> None:
-        """Fold one turn's usage into the project's running token tally."""
+    def record_usage(
+        self,
+        project_path: str,
+        usage: dict | None,
+        model_usage: dict | None = None,
+    ) -> None:
+        """Fold one turn's usage into the project's running token tally.
+
+        ``model_usage`` mirrors ResultMessage.model_usage — a dict keyed by
+        model name with camelCase token fields. When present it is the
+        authoritative source: ``model_usage[<main_model>]`` matches ``usage``
+        byte-for-byte, and subagent models appear as extra entries that
+        ``usage`` does not include. So the session-wide total prefers the
+        ``model_usage`` sum (correct main + subagents); only when the SDK
+        omits ``model_usage`` do we fall back to the main-only ``usage`` sum.
+        """
         if not usage:
             return
         self._last_usage[project_path] = usage
-        total = (
-            usage.get("input_tokens", 0)
-            + usage.get("output_tokens", 0)
-            + usage.get("cache_read_input_tokens", 0)
-            + usage.get("cache_creation_input_tokens", 0)
-        )
+        if model_usage:
+            self._last_model_usage[project_path] = model_usage
+            bucket = self._session_model_tokens.setdefault(project_path, {})
+            turn_total = 0
+            for model, entry in model_usage.items():
+                per_model_total = (
+                    entry.get("inputTokens", 0)
+                    + entry.get("outputTokens", 0)
+                    + entry.get("cacheReadInputTokens", 0)
+                    + entry.get("cacheCreationInputTokens", 0)
+                )
+                bucket[model] = bucket.get(model, 0) + per_model_total
+                turn_total += per_model_total
+        else:
+            turn_total = (
+                usage.get("input_tokens", 0)
+                + usage.get("output_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0)
+            )
         self._session_tokens[project_path] = (
-            self._session_tokens.get(project_path, 0) + total
+            self._session_tokens.get(project_path, 0) + turn_total
         )
 
     async def interrupt(self) -> None:
@@ -1199,7 +1266,7 @@ class ClaudeRunner:
             await emit(event)
         if isinstance(message, ResultMessage):
             _log_cache_usage(message.usage)
-            self.record_usage(project_path, message.usage)
+            self.record_usage(project_path, message.usage, message.model_usage)
             if message.session_id:
                 self._session_ids[project_path] = message.session_id
                 # The SDK occasionally rotates session_id mid-conversation;

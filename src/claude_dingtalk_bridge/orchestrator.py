@@ -13,6 +13,7 @@ from claude_dingtalk_bridge.claude_runner import (
     TodoEvent,
     ToolEvent,
     _cache_breakdown,
+    _model_cache_breakdown,
     tool_summary,
 )
 from claude_dingtalk_bridge.commands import CommandType, parse_command
@@ -26,6 +27,7 @@ from claude_dingtalk_bridge.display import (
     display_path,
     format_tokens,
     md_escape,
+    short_model_name,
 )
 from claude_dingtalk_bridge.sessions import (
     find_session,
@@ -451,18 +453,65 @@ class Orchestrator:
             f"- **State:** {state}",
             f"- **Project:** {md_escape(project.name)}",
             f"- **Output:** {'verbose' if self._verbose else 'brief'}",
-            f"- **Model:** {self._runner.model_override or self._runner.observed_model or 'default'}",
+            f"- **Model:** {short_model_name(self._runner.model_override or self._runner.observed_model or 'default')}",
         ]
         if self._dry_run:
             lines.append("- **Debug:** on")
         tokens = self._runner.session_tokens(project.path)
-        lines.append(f"- **Session tokens:** {format_tokens(tokens)}")
+        if tokens:
+            lines.append(f"- **Session tokens:** {format_tokens(tokens)}")
+            # Per-model sub-bullets are only useful when more than one model
+            # ran (main + subagents); for a single-model session they would
+            # just restate the parent line. Sorted by token count desc so the
+            # dominant consumer leads.
+            model_tokens = self._runner.session_model_tokens(project.path)
+            if len(model_tokens) > 1:
+                for model, count in sorted(
+                    model_tokens.items(), key=lambda kv: kv[1], reverse=True
+                ):
+                    lines.append(
+                        f"  - {short_model_name(model)}: {format_tokens(count)}"
+                    )
         usage = self._runner.last_usage(project.path)
         if usage:
-            b = _cache_breakdown(usage)
+            # When model_usage is present it's the authoritative source; the
+            # snake_case usage dict only covers the main agent. Sum across
+            # models so the parent line stays consistent with Session tokens
+            # and the per-model sub-bullets add up to it.
+            model_usage = self._runner.last_model_usage(project.path)
+            if model_usage:
+                aggregate = {
+                    "input_tokens": sum(e.get("inputTokens", 0) for e in model_usage.values()),
+                    "output_tokens": sum(e.get("outputTokens", 0) for e in model_usage.values()),
+                    "cache_read_input_tokens": sum(e.get("cacheReadInputTokens", 0) for e in model_usage.values()),
+                    "cache_creation": {
+                        # model_usage has no 1h/5m split; lump all into 1h so
+                        # the parent line's "creation N" still matches the
+                        # sum of the per-model rows. The original 1h/5m split
+                        # for the main agent is still preserved in logs via
+                        # _log_cache_usage(usage).
+                        "ephemeral_1h_input_tokens": sum(e.get("cacheCreationInputTokens", 0) for e in model_usage.values()),
+                        "ephemeral_5m_input_tokens": 0,
+                    },
+                }
+                b = _cache_breakdown(aggregate)
+            else:
+                b = _cache_breakdown(usage)
             lines.append(
                 f"- **Cache last turn:** read {b['read']} (hit {b['hit']}) · creation {b['creation']}"
             )
+            if model_usage and len(model_usage) > 1:
+                for model, entry in sorted(
+                    model_usage.items(),
+                    key=lambda kv: kv[1].get("cacheReadInputTokens", 0)
+                    + kv[1].get("cacheCreationInputTokens", 0),
+                    reverse=True,
+                ):
+                    mb = _model_cache_breakdown(entry)
+                    lines.append(
+                        f"  - {short_model_name(model)}: "
+                        f"read {mb['read']} (hit {mb['hit']}) · creation {mb['creation']}"
+                    )
         await self._send_markdown("\n".join(lines))
 
     async def _cmd_clear(self) -> None:
