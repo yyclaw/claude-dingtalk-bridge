@@ -8,8 +8,19 @@ are reused across the codebase — keep them small and pure.
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
+
+# Strip the trailing `-YYYYMMDD` datestamp some Anthropic model IDs carry
+# (e.g. `claude-haiku-4-5-20251001`). The base ID is what users recognize;
+# the date is dead weight on a phone status line.
+_MODEL_DATE_SUFFIX = re.compile(r"-\d{8}(?=\[|$)")
+
+# After prefix/datestamp stripping, the only remaining digit-dash-digit run
+# is the major/minor version (e.g. `opus-4-7`). Render it as `opus-4.7` so a
+# phone reader doesn't parse the hyphen as a range.
+_MODEL_VERSION_DASH = re.compile(r"(\d)-(\d)")
 
 # Numeric HTML entities for markdown-significant chars. The markdown parser
 # sees the entity (not the glyph) so it triggers no emphasis/code/link/tag;
@@ -41,6 +52,17 @@ def format_size(num_bytes: int) -> str:
     if num_bytes < 1024 * 1024:
         return f"{num_bytes / 1024:.1f}KB"
     return f"{num_bytes / (1024 * 1024):.1f}MB"
+
+
+def short_model_name(model: str) -> str:
+    """Phone-friendly form of an Anthropic model id.
+
+    Drops the redundant ``claude-`` prefix and any ``-YYYYMMDD`` datestamp,
+    preserving suffixes like ``[1m]`` that denote a meaningful variant.
+    """
+    name = model.removeprefix("claude-")
+    name = _MODEL_DATE_SUFFIX.sub("", name)
+    return _MODEL_VERSION_DASH.sub(r"\1.\2", name)
 
 
 def format_tokens(n: int) -> str:

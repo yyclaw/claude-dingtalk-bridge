@@ -6,6 +6,7 @@ from claude_dingtalk_bridge.display import (
     format_relative_time,
     format_size,
     md_escape,
+    short_model_name,
 )
 
 
@@ -97,3 +98,11 @@ def test_collapse_home_guards_against_empty_or_root_home(monkeypatch):
 
     monkeypatch.setattr(display_mod, "_HOME", "/")
     assert display_mod._collapse_home("/tmp/x") == "/tmp/x"
+
+
+def test_short_model_name_strips_claude_prefix_and_datestamp():
+    assert short_model_name("claude-opus-4-7") == "opus-4.7"
+    assert short_model_name("claude-opus-4-7[1m]") == "opus-4.7[1m]"
+    assert short_model_name("claude-haiku-4-5-20251001") == "haiku-4.5"
+    assert short_model_name("claude-haiku-4-5-20251001[1m]") == "haiku-4.5[1m]"
+    assert short_model_name("claude-sonnet-4-6") == "sonnet-4.6"
