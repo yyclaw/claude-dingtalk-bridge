@@ -1855,6 +1855,40 @@ def test_log_sdk_message_uses_verb_first_naming_for_assistant(caplog):
     assert not any(l.startswith("sdk_message ") for l in info_lines)
 
 
+def test_log_sdk_message_thinking_only_assistant_gets_thinking_verb(caplog):
+    # Extended-thinking turns deliver an AssistantMessage whose content is
+    # solely ThinkingBlock(s) — the thinking phase closing snapshot. Promote
+    # it to verb `thinking` so it doesn't read as a stray plain assistant row.
+    msg = AssistantMessage(
+        content=[ThinkingBlock(thinking="", signature="sig")],
+        model="claude-opus-4-7",
+        usage={"input_tokens": 6, "output_tokens": 8, "cache_read_input_tokens": 0},
+    )
+    with caplog.at_level(_logging.INFO, logger="claude_dingtalk_bridge.claude_runner"):
+        _log_sdk_message(msg)
+    info_lines = [r.getMessage() for r in caplog.records if r.levelno == _logging.INFO]
+    assert any(l.startswith("thinking ") for l in info_lines)
+    assert not any(l.startswith("assistant ") for l in info_lines)
+
+
+def test_log_sdk_message_assistant_with_text_and_thinking_stays_assistant(caplog):
+    # A message that mixes thinking with text or tool_use is still an
+    # assistant-level event — the `thinking` verb only kicks in when the
+    # snapshot is purely a thinking block.
+    msg = AssistantMessage(
+        content=[
+            ThinkingBlock(thinking="planning…", signature="sig"),
+            TextBlock(text="hi"),
+        ],
+        model="opus",
+    )
+    with caplog.at_level(_logging.INFO, logger="claude_dingtalk_bridge.claude_runner"):
+        _log_sdk_message(msg)
+    info_lines = [r.getMessage() for r in caplog.records if r.levelno == _logging.INFO]
+    assert any(l.startswith("assistant ") for l in info_lines)
+    assert not any(l.startswith("thinking ") for l in info_lines)
+
+
 def test_log_sdk_message_verb_first_for_known_system_subtypes(caplog):
     # init/permission_denied/compact_boundary/task_updated are promoted to
     # top-level verbs and the redundant `subtype=` prefix is stripped from

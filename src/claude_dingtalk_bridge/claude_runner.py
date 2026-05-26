@@ -780,6 +780,15 @@ def _message_verb(message) -> str:
     if isinstance(message, HookEventMessage):
         # SDK wire subtype is "hook_started" / "hook_response" — use directly.
         return message.subtype
+    if isinstance(message, AssistantMessage):
+        # Extended-thinking turns deliver multiple AssistantMessages per turn,
+        # boundaried by content_block_stop. A snapshot whose content is solely
+        # ThinkingBlock(s) (no text, no tool_use) is the thinking phase
+        # closing — promote it to its own verb so it doesn't masquerade as a
+        # plain assistant usage row downstream.
+        if message.content and all(isinstance(b, ThinkingBlock) for b in message.content):
+            return "thinking"
+        return "assistant"
     if type(message) in _VERB_BY_TYPE:
         return _VERB_BY_TYPE[type(message)]
     if isinstance(message, SystemMessage):
