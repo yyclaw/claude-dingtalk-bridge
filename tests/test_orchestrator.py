@@ -844,7 +844,7 @@ async def test_status_shows_session_tokens_and_cache():
     await orchestrator.handle_message("/status", AUTHORIZED)
     msg = "\n".join(sent)
     assert "**Session tokens:** 1.2M" in msg
-    assert "**Cache last turn:** read 45K (hit 84.9%) · creation 8K" in msg
+    assert "**Cache last turn:** cached 45K (84.9%) · new 8K" in msg
 
 
 async def test_status_shows_per_model_breakdown():
@@ -877,9 +877,9 @@ async def test_status_shows_per_model_breakdown():
     assert "**Session tokens:** 1.2M" in msg
     assert "  - opus-4.7[1m]: 900K" in msg
     assert "  - haiku-4.5: 300K" in msg
-    assert "**Cache last turn:** read 45K (hit 84.7%) · creation 8K" in msg
-    assert "  - opus-4.7[1m]: read 45K (hit 86.4%) · creation 7K" in msg
-    assert "  - haiku-4.5: read 0 (hit 0.0%) · creation 1K" in msg
+    assert "**Cache last turn:** cached 45K (84.7%) · new 8K" in msg
+    assert "  - opus-4.7[1m]: cached 45K (86.4%) · new 7K" in msg
+    assert "  - haiku-4.5: cached 0 (0.0%) · new 1K" in msg
 
 
 async def test_status_single_model_omits_breakdown():

@@ -498,7 +498,7 @@ class Orchestrator:
             else:
                 b = _cache_breakdown(usage)
             lines.append(
-                f"- **Cache last turn:** read {b['read']} (hit {b['hit']}) · creation {b['creation']}"
+                f"- **Cache last turn:** cached {b['read']} ({b['hit']}) · new {b['creation']}"
             )
             if model_usage and len(model_usage) > 1:
                 for model, entry in sorted(
@@ -510,7 +510,7 @@ class Orchestrator:
                     mb = _model_cache_breakdown(entry)
                     lines.append(
                         f"  - {short_model_name(model)}: "
-                        f"read {mb['read']} (hit {mb['hit']}) · creation {mb['creation']}"
+                        f"cached {mb['read']} ({mb['hit']}) · new {mb['creation']}"
                     )
         await self._send_markdown("\n".join(lines))
 
