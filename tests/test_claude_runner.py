@@ -442,15 +442,32 @@ async def test_note_system_message_captures_model():
 
     runner = ClaudeRunner()
     init = SystemMessage(subtype="init", data={"model": "claude-opus-4-7"})
-    runner._note_system_message(init)
+    runner._note_system_message(init, "/tmp/proj")
     assert runner.observed_model == "claude-opus-4-7"
+
+
+async def test_note_system_message_caches_session_id_for_callback_lookup():
+    # Cached session id lets the SDK's can_use_tool callback (which runs in
+    # a forked task that can't see contextvar updates) restamp log_context
+    # before invoking the orchestrator's handlers — without this cache,
+    # turn 1 of a brand-new project tags ask_user_question / permission
+    # log lines with `session=-`.
+    from claude_agent_sdk import SystemMessage
+
+    runner = ClaudeRunner()
+    init = SystemMessage(
+        subtype="init",
+        data={"model": "opus", "session_id": "03cdbc4a-1234"},
+    )
+    runner._note_system_message(init, "/tmp/proj")
+    assert runner.current_session("/tmp/proj") == "03cdbc4a-1234"
 
 
 def test_note_system_message_ignores_non_init():
     from claude_agent_sdk import SystemMessage
 
     runner = ClaudeRunner()
-    runner._note_system_message(SystemMessage(subtype="other", data={"model": "x"}))
+    runner._note_system_message(SystemMessage(subtype="other", data={"model": "x"}), "/tmp/proj")
     assert runner.observed_model is None
 
 
@@ -2147,6 +2164,36 @@ async def test_interrupt_is_a_noop_without_active_client():
     await runner.interrupt()  # no active client — must not raise
 
 
+async def test_can_use_tool_restamps_session_from_cache():
+    # The SDK forks its callback task at connect() time, which means the
+    # callback inherits whatever log_context.session was set BEFORE init —
+    # for turn 1 of a new project, that's `-`. _can_use_tool reads the
+    # cached session id (populated by _note_system_message on init) and
+    # restamps the contextvar so the handler's log lines carry the real id.
+    from claude_agent_sdk import PermissionResultAllow
+    from claude_dingtalk_bridge import log_context
+
+    runner = ClaudeRunner()
+    runner._session_ids["/tmp/proj"] = "03cdbc4a-cached-id"
+
+    observed_session: list[str] = []
+
+    async def permission_handler(tool_name, input_data, project_path):
+        observed_session.append(log_context._session.get())
+        return True
+
+    runner.permission_handler = permission_handler
+    options = runner._build_options("/tmp/proj")
+    # Start the contextvar at the "stale" sentinel that mirrors orchestrator
+    # behaviour before the cache fix.
+    log_context.set_session(None)  # → "-"
+    assert log_context._session.get() == "-"
+    result = await options.can_use_tool("Bash", {"command": "ls"}, None)
+    assert isinstance(result, PermissionResultAllow)
+    # Inside the handler, the contextvar should be the cached prefix.
+    assert observed_session == ["03cdbc4a"]
+
+
 async def test_can_use_tool_routes_ask_user_question_to_handler():
     from claude_agent_sdk import PermissionResultDeny
 
@@ -2231,7 +2278,7 @@ def test_note_system_message_init_without_model_keeps_none():
     from claude_agent_sdk import SystemMessage
 
     runner = ClaudeRunner()
-    runner._note_system_message(SystemMessage(subtype="init", data={}))
+    runner._note_system_message(SystemMessage(subtype="init", data={}), "/tmp/proj")
     assert runner.observed_model is None
 
 

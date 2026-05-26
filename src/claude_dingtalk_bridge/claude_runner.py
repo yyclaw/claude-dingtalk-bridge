@@ -1023,13 +1023,23 @@ class ClaudeRunner:
         """The model reported by the SDK init message, or None until a turn has run."""
         return self._observed_model
 
-    def _note_system_message(self, message) -> None:
+    def _note_system_message(self, message, project_path: str) -> None:
         """Capture the model from the SDK init message for /model display, and
         refresh the log-context session id once the SDK reports it.
 
         A brand-new session has no id known to us until init lands; resumed
         sessions already had one set by run_turn. Either way, init carries the
         authoritative value, so update unconditionally.
+
+        We also cache the session id into ``self._session_ids[project_path]``
+        immediately on init so the can_use_tool callback (which runs in a
+        separate task forked by the SDK at connect-time and therefore can't
+        see the contextvar update we do here) has somewhere to read the
+        current id back from. Without this cache, turn 1 of a brand-new
+        project produces orchestrator log lines stamped ``session=-`` for
+        ask_user_question / permission events — the contextvar in the
+        callback's task is still the ``-`` that ``orchestrator._run`` set
+        before connect.
         """
         if isinstance(message, SystemMessage) and message.subtype == "init":
             data = message.data or {}
@@ -1039,6 +1049,7 @@ class ClaudeRunner:
             session_id = data.get("session_id")
             if session_id:
                 log_context.set_session(session_id)
+                self._session_ids[project_path] = session_id
 
     def record_usage(self, project_path: str, usage: dict | None) -> None:
         """Fold one turn's usage into the project's running token tally."""
@@ -1079,6 +1090,12 @@ class ClaudeRunner:
 
     def _build_options(self, project_path: str) -> ClaudeAgentOptions:
         async def _can_use_tool(tool_name, input_data, context):
+            # SDK forks this callback's task at connect() — before init lands
+            # — so the inherited log_context.session is stale on turn 1.
+            # Restamp from our cache so handler log lines carry the right id.
+            cached = self._session_ids.get(project_path)
+            if cached:
+                log_context.set_session(cached)
             if tool_name == "AskUserQuestion" and self.question_handler is not None:
                 answer = await self.question_handler(input_data, project_path)
                 return PermissionResultDeny(message=answer, interrupt=False)
@@ -1139,7 +1156,7 @@ class ClaudeRunner:
         # already carries the newly-known session_id — otherwise the `init …`
         # row would render with `session=-` and only subsequent rows show
         # the real id.
-        self._note_system_message(message)
+        self._note_system_message(message, project_path)
         _log_sdk_message(message)
         for event in _translate(message, subagents, acknowledged):
             _track_pending(event, pending)
