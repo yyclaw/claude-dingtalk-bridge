@@ -40,18 +40,14 @@ permissions:
     - "git log"
     - "ls"
     - "cat"
-    - "pnpm test"
-    - "go test"
+    # Add your project's test command, e.g.: "pnpm test", "go test", "pytest -q"
 
 # Timeout (seconds) for a permission request; denied automatically on timeout.
 permission_timeout_seconds: 600
 
-# # Geo gate (optional): omit the whole section to skip the check and the proxy.
-# geo:
-#   proxy_url: http://127.0.0.1:8118      # local proxy address, shared by http/https
-#   target_country: US                    # expected exit-IP countryCode
-#   # ip-api.com's free tier is HTTP-only (HTTPS needs a paid plan), so this
-#   # request is unencrypted: a network MITM could spoof the country and
-#   # defeat the gate. Point this at an HTTPS endpoint if you have one.
-#   geo_service: http://ip-api.com/json   # returns the caller's exit IP geolocation
-#   timeout_seconds: 3                    # geo service request timeout, in seconds
+# Geo gate: omit the whole section to skip the check and the proxy.
+geo:
+  proxy_url: http://127.0.0.1:8118      # local proxy address, shared by http/https
+  target_country: US                    # expected exit-IP countryCode
+  geo_service: http://ip-api.com/json   # returns the caller's exit IP geolocation
+  timeout_seconds: 3                    # geo service request timeout, in seconds
