@@ -23,10 +23,38 @@ setup: ## Create the virtualenv and install dependencies
 	python3 -m venv $(VENV)
 	$(PIP) install -e ".[dev]"
 
+# Compare leaf-key paths in config.example.yaml against the installed config and
+# list anything the template adds. Dicts recurse, lists/scalars are treated as
+# leaves -- e.g. permissions.allowed_bash is one path, not one per item.
+define CONFIG_DIFF_PY
+import sys, pathlib, yaml
+def leaves(node, prefix=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            p = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                yield from leaves(v, p)
+            else:
+                yield p
+example = yaml.safe_load(pathlib.Path("config.example.yaml").read_text()) or {}
+user = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text()) or {}
+user_paths = set(leaves(user))
+missing = [p for p in leaves(example) if p not in user_paths]
+if missing:
+    print("New keys in config.example.yaml not present in your config:")
+    for p in missing:
+        print(f"  - {p}")
+    print("Review config.example.yaml and copy over what you need.")
+endef
+export CONFIG_DIFF_PY
+
 config: ## Create the config file from the template (if absent)
 	@mkdir -p $(dir $(CONFIG))
 	@if [ -f "$(CONFIG)" ]; then \
 		echo "Config already exists: $(CONFIG)"; \
+		if [ -x "$(PY)" ]; then \
+			printf '%s\n' "$$CONFIG_DIFF_PY" | $(PY) - "$(CONFIG)"; \
+		fi; \
 	else \
 		cp config.example.yaml "$(CONFIG)" && \
 		echo "Created: $(CONFIG) -- edit it with client_id / client_secret / authorized_user_id and the project list"; \
