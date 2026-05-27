@@ -925,7 +925,7 @@ class Orchestrator:
                 chip, input_preview,
             )
             await self._send(
-                f"🔐 Permission needed\n{desc}\nReply ok to allow, no to deny."
+                f"🔐 **Permission needed**\n{desc}\n\nReply `ok` to allow, `no` to deny."
             )
             start = loop.time()
             try:
