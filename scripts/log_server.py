@@ -512,6 +512,60 @@ def _verb_turn_interrupted(tail: str):
     return chips, body, ""
 
 
+def _tool_chip_html(tool: str) -> str:
+    """Render `Name#id` into the conventional name + #id spans."""
+    name, _, tid = tool.partition("#")
+    if not tool:
+        return ""
+    if tid:
+        return (
+            f'<span class="tool-name">{html.escape(name)}</span> '
+            f'<span class="tool-id">#{html.escape(tid)}</span>'
+        )
+    return f'<span class="tool-name">{html.escape(name)}</span>'
+
+
+def _verb_permission_escalate(tail: str):
+    args = parse_kv_args(tail)
+    tool = args.get("tool", "")
+    inp = args.get("input", "")
+    chips = '<span class="chip ask">🔐 permission ask</span>'
+    parts = []
+    if tool:
+        parts.append(_tool_chip_html(tool))
+    if inp:
+        v, truncated = detect_truncated(inp)
+        ell = TRUNCATED_SPAN if truncated else ""
+        parts.append(
+            f'<span class="preview">{html.escape(v)}{ell}</span>'
+        )
+    body = '<span class="sep">·</span>'.join(parts)
+    return chips, body, ""
+
+
+def _verb_permission_reply(tail: str, kind: str = "reply"):
+    args = parse_kv_args(tail)
+    tool = args.get("tool", "")
+    waited = args.get("waited", "")
+    result = args.get("result", "")
+    # Denied / timed-out replies belong to the critical family (red),
+    # matching the existing `🚫 permission denied` chip; clean allows
+    # mirror the ask-family `❓ answered` outline. The denied chip splits
+    # `reply` (user said no) vs `timeout` (no reply in time) so the cause
+    # is visible at a glance.
+    if result == "allowed":
+        chips = '<span class="chip ask-out">🔐 allowed</span>'
+    else:
+        chips = f'<span class="chip crit">🚫 denied · {kind}</span>'
+    parts = []
+    if tool:
+        parts.append(_tool_chip_html(tool))
+    if waited:
+        parts.append(_kv_span("waited", waited))
+    body = '<span class="sep">·</span>'.join(parts)
+    return chips, body, ""
+
+
 def _kv_or_empty(args: dict[str, str], key: str) -> str:
     v = args.get(key)
     return _kv_span(key, v) if v is not None else ""
@@ -955,6 +1009,12 @@ def _dispatch_verb(module: str, rest: str):
             return _verb_ask_pending(rest[len("ask_user_question"):].lstrip())
         if rest.startswith("turn interrupted"):
             return _verb_turn_interrupted(rest[len("turn interrupted"):].lstrip())
+        if rest.startswith("permission escalate"):
+            return _verb_permission_escalate(rest[len("permission escalate"):].lstrip())
+        if rest.startswith("permission reply"):
+            return _verb_permission_reply(rest[len("permission reply"):].lstrip(), "reply")
+        if rest.startswith("permission timeout"):
+            return _verb_permission_reply(rest[len("permission timeout"):].lstrip(), "timeout")
     if module == "claude_runner":
         if rest.startswith("init "):
             return _verb_init(rest[len("init "):])
@@ -2043,16 +2103,28 @@ __CSS__
               <div class="chip-row"><span class="chip ask-out">❓ answered</span></div>
             </td>
             <td>User → assistant. The user has replied to the pending question (<code>ask_user_question answered</code>).</td></tr>
+        <tr><td class="family-cell"></td>
+            <td class="chip-cell">
+              <div class="chip-row"><span class="chip ask">🔐 permission ask</span></div>
+            </td>
+            <td>Assistant → user. The orchestrator escalated a tool call to the phone for approval (<code>permission escalate</code>). The tool name and short chip id pair this entry with its reply below.</td></tr>
+        <tr><td class="family-cell"></td>
+            <td class="chip-cell">
+              <div class="chip-row"><span class="chip ask-out">🔐 allowed</span></div>
+            </td>
+            <td>User → assistant. The user approved the escalation (<code>permission reply … result=allowed</code>).</td></tr>
 
         <tr><td class="family-cell"><span class="legend-swatch" style="background:var(--fam-crit)"></span>Critical</td>
             <td class="chip-cell">
               <div class="chip-row"><span class="chip crit">🚫 permission denied</span></div>
+              <div class="chip-row"><span class="chip crit">🚫 denied · reply</span></div>
+              <div class="chip-row"><span class="chip crit">🚫 denied · timeout</span></div>
               <div class="chip-row"><span class="chip crit">interrupted</span></div>
               <div class="chip-row"><span class="chip crit">⚠️ rate limit · 95%</span></div>
               <div class="chip-row"><span class="chip crit">turn err · error_max_turns</span></div>
               <div class="chip-row"><span class="chip crit">⚠️ assistant error</span></div>
             </td>
-            <td>Events that warrant attention: <code>permission_denied</code>, <code>turn interrupted</code>, <code>rate_limit_event</code>, <code>result subtype</code> other than <code>success</code>, and <code>AssistantMessage</code> with an <code>error=...</code> field (typically a synthetic API-error reply with a 5xx body).</td></tr>
+            <td>Events that warrant attention: <code>permission_denied</code> (SDK-side, after the user said no), the orchestrator's matching <code>permission reply … result=denied</code> and <code>permission timeout</code>, <code>turn interrupted</code>, <code>rate_limit_event</code>, <code>result subtype</code> other than <code>success</code>, and <code>AssistantMessage</code> with an <code>error=...</code> field (typically a synthetic API-error reply with a 5xx body).</td></tr>
 
         <tr><td class="family-cell"><span class="legend-swatch" style="background:var(--fam-tool)"></span>Tool</td>
             <td class="chip-cell">

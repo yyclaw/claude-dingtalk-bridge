@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 from typing import Awaitable, Callable
 
 from claude_dingtalk_bridge.claude_runner import (
@@ -918,9 +919,10 @@ class Orchestrator:
             desc = f"{tool_name} · {summary}" if summary else tool_name
             loop = asyncio.get_running_loop()
             self._permission_future = loop.create_future()
+            chip = f"{tool_name}#{secrets.token_hex(4)}"
             logger.info(
                 'permission escalate tool=%s input="%s" → phone',
-                tool_name, input_preview,
+                chip, input_preview,
             )
             await self._send(
                 f"🔐 Permission needed\n{desc}\nReply ok to allow, no to deny."
@@ -933,7 +935,7 @@ class Orchestrator:
                 )
                 logger.info(
                     "permission reply tool=%s waited=%.1fs result=%s",
-                    tool_name,
+                    chip,
                     loop.time() - start,
                     "allowed" if allowed else "denied",
                 )
@@ -941,7 +943,7 @@ class Orchestrator:
             except asyncio.TimeoutError:
                 logger.info(
                     "permission timeout tool=%s waited=%.1fs result=denied",
-                    tool_name, loop.time() - start,
+                    chip, loop.time() - start,
                 )
                 await self._send("⏱ Permission request timed out — denied.")
                 return False
