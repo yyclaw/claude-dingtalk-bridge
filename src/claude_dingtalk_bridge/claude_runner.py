@@ -1359,12 +1359,18 @@ class ClaudeRunner:
                         # settled, no late relay turn is coming. Exit silently.
                         next_msg.cancel()
                         cancel_wait.cancel()
+                        await asyncio.gather(
+                            next_msg, cancel_wait, return_exceptions=True
+                        )
                         return
                     if next_msg not in done:
                         # Pre-empted by cancel_drain — abandon the read and
                         # return silently. No timeout event: the user is
                         # explicitly moving on.
                         next_msg.cancel()
+                        await asyncio.gather(
+                            next_msg, cancel_wait, return_exceptions=True
+                        )
                         return
                     cancel_wait.cancel()
                     try:
