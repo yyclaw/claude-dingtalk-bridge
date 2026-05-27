@@ -1,6 +1,19 @@
 from __future__ import annotations
 
 
+def question_label(question: dict) -> str:
+    """Short label for a question — prefers `header` (chip-style tag) so it
+    reads well as a `- {label}: {reply}` line. Falls back to the full question
+    text, then empty."""
+    return question.get("header") or question.get("question") or ""
+
+
+def question_preview(question: dict) -> str:
+    """Log/preview text for a question — prefers the full `question` so the
+    reader sees what was actually asked, falling back to `header`."""
+    return question.get("question") or question.get("header") or ""
+
+
 def format_question(question: dict, index: int, total: int) -> str:
     """Render one AskUserQuestion entry as a phone message."""
     header = question.get("header") or ""

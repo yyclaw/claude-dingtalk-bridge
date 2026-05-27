@@ -22,7 +22,12 @@ from claude_dingtalk_bridge.geo import GeoCheck
 from claude_dingtalk_bridge import log_context
 from claude_dingtalk_bridge.permissions import Decision, PermissionPolicy
 from claude_dingtalk_bridge.projects import ProjectRegistry
-from claude_dingtalk_bridge.questions import format_question, parse_answer
+from claude_dingtalk_bridge.questions import (
+    format_question,
+    parse_answer,
+    question_label,
+    question_preview,
+)
 from claude_dingtalk_bridge.display import (
     display_path,
     format_tokens,
@@ -953,17 +958,13 @@ class Orchestrator:
         logger.info(
             "ask_user_question count=%d first=%r",
             len(questions),
-            _summary(questions[0].get("question") or questions[0].get("header") or ""),
+            _summary(question_preview(questions[0])),
         )
         async with self._permission_lock:
             answers: list[str] = []
             for idx, question in enumerate(questions):
                 options = question.get("options") or []
-                label = (
-                    question.get("header")
-                    or question.get("question")
-                    or "Question"
-                )
+                label = question_label(question) or "Question"
                 reply = await self._ask_one(question, idx, len(questions), options)
                 if reply is None:
                     logger.info(

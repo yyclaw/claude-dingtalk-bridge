@@ -29,6 +29,7 @@ from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
 from claude_dingtalk_bridge import log_context
 from claude_dingtalk_bridge.display import collapse_inline_paths, display_path, format_tokens
+from claude_dingtalk_bridge.questions import question_preview
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +228,7 @@ def _tool_summary_raw(name: str, tool_input: dict) -> str:
         qs = tool_input.get("questions") or []
         if not qs:
             return ""
-        first = qs[0].get("question") or qs[0].get("header") or ""
+        first = question_preview(qs[0])
         return f"{first} (×{len(qs)})" if len(qs) > 1 else first
     if name == "Grep":
         # `pattern in path` reads naturally and surfaces both fields without
