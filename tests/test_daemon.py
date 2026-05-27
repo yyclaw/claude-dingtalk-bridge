@@ -375,8 +375,6 @@ class _FakeStreamClient:
 def _patch_run(monkeypatch, keyboard=False):
     monkeypatch.setattr(daemon, "load_config", make_config)
     monkeypatch.setattr(daemon, "_disable_websocket_proxy", lambda: None)
-    # Skip the reconnect sleep so KeyboardInterrupt tests finish quickly.
-    monkeypatch.setattr(daemon, "_RECONNECT_DELAY", 0.0)
     _FakeStreamClient.instances = []
 
     class _Client(_FakeStreamClient):
@@ -506,23 +504,23 @@ def test_filter_client_noise_drops_and_downgrades():
     ]
 
 
-async def test_drive_stream_client_reconnects_on_exception(monkeypatch):
-    monkeypatch.setattr(daemon, "_RECONNECT_DELAY", 0.0)
+async def test_drive_stream_client_reconnects_on_failure(monkeypatch):
+    # The drive loop must call _serve_stream_once again after a failed attempt
+    # — a transient gateway hiccup mustn't terminate the daemon.
+    calls = 0
 
-    class _FlakyClient:
-        def __init__(self):
-            self.calls = 0
+    async def fake_serve_once(client):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return None  # connection never came up
+        raise asyncio.CancelledError  # break the loop on the 3rd attempt
 
-        async def start(self):
-            self.calls += 1
-            if self.calls < 3:
-                raise RuntimeError("network blip")
-            raise asyncio.CancelledError  # break the loop on the 3rd attempt
-
-    client = _FlakyClient()
+    monkeypatch.setattr(daemon, "_serve_stream_once", fake_serve_once)
+    state = daemon.ReconnectState(delays=(0.0,), jitter=False)
     with contextlib.suppress(asyncio.CancelledError):
-        await daemon._drive_stream_client(client)
-    assert client.calls == 3
+        await daemon._drive_stream_client(object(), state=state)
+    assert calls == 3
 
 
 async def test_chat_handler_unknown_message_type_notifies_user(caplog):
@@ -657,15 +655,17 @@ async def test_drive_stream_client_returns_on_cancel_during_reconnect_sleep(
     # The reconnect loop sleeps between attempts; cancelling the task while
     # the sleep is in flight must exit cleanly (no warning, no re-raise).
     # Use a non-zero delay so the cancel reliably lands on the sleep, not on
-    # client.start().
-    monkeypatch.setattr(daemon, "_RECONNECT_DELAY", 5.0)
+    # _serve_stream_once.
+    async def fake_serve_once(client):
+        return None  # immediate failure → enter sleep
 
-    class _AlwaysFailingClient:
-        async def start(self):
-            raise RuntimeError("blip")
+    monkeypatch.setattr(daemon, "_serve_stream_once", fake_serve_once)
+    state = daemon.ReconnectState(delays=(5.0,), jitter=False)
 
-    task = asyncio.create_task(daemon._drive_stream_client(_AlwaysFailingClient()))
-    # Yield enough times for start() to fail and the sleep to begin.
+    task = asyncio.create_task(
+        daemon._drive_stream_client(object(), state=state)
+    )
+    # Yield enough times for _serve_stream_once to fail and the sleep to begin.
     for _ in range(5):
         await asyncio.sleep(0)
     task.cancel()
@@ -708,3 +708,309 @@ async def test_serve_tolerates_missing_signal_handler_support(monkeypatch):
     # _serve still wired the rest of the lifecycle even though signal handlers
     # couldn't be installed.
     assert orch.shutdown_called == 1
+
+
+# --- _open_connection / _serve_stream_once ----------------------------
+
+
+class _FakeOpenClient:
+    """Minimal stand-in exposing what _open_connection reads off the SDK client."""
+
+    def __init__(self, *, callbacks=(), event_required=False):
+        self._is_event_required = event_required
+        self.callback_handler_map = {topic: object() for topic in callbacks}
+
+        class _Credential:
+            client_id = "cid"
+            client_secret = "csec"
+
+        self.credential = _Credential()
+
+    def get_host_ip(self):
+        return "127.0.0.1"
+
+
+def test_open_connection_posts_with_timeout_and_returns_json(monkeypatch):
+    import json as _json
+
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"endpoint": "wss://gw", "ticket": "tkt"}
+
+    def fake_post(url, headers, data, timeout):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        captured["body"] = _json.loads(data)
+        return _Resp()
+
+    monkeypatch.setattr(daemon.requests, "post", fake_post)
+    client = _FakeOpenClient(callbacks=["topic-a"], event_required=False)
+
+    result = daemon._open_connection(client)
+
+    assert result == {"endpoint": "wss://gw", "ticket": "tkt"}
+    # The whole point of this wrapper: a real timeout, not the SDK's None.
+    assert captured["timeout"] == daemon._OPEN_CONNECTION_TIMEOUT
+    assert captured["body"]["clientId"] == "cid"
+    assert captured["body"]["clientSecret"] == "csec"
+    assert {"type": "CALLBACK", "topic": "topic-a"} in captured["body"]["subscriptions"]
+    # No EVENT topic when the client doesn't ask for one.
+    assert all(s["type"] != "EVENT" for s in captured["body"]["subscriptions"])
+
+
+def test_open_connection_subscribes_to_event_topic_when_required(monkeypatch):
+    import json as _json
+
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"endpoint": "wss://gw", "ticket": "tkt"}
+
+    def fake_post(url, headers, data, timeout):
+        captured["body"] = _json.loads(data)
+        return _Resp()
+
+    monkeypatch.setattr(daemon.requests, "post", fake_post)
+    client = _FakeOpenClient(callbacks=[], event_required=True)
+
+    daemon._open_connection(client)
+
+    assert {"type": "EVENT", "topic": "*"} in captured["body"]["subscriptions"]
+
+
+def test_open_connection_returns_none_and_warns_on_request_error(monkeypatch, caplog):
+    import logging
+
+    def fake_post(*_a, **_kw):
+        raise daemon.requests.exceptions.ConnectTimeout("connect timeout")
+
+    monkeypatch.setattr(daemon.requests, "post", fake_post)
+    client = _FakeOpenClient(callbacks=["x"], event_required=False)
+
+    with caplog.at_level(logging.WARNING, logger="claude_dingtalk_bridge.daemon"):
+        result = daemon._open_connection(client)
+
+    assert result is None
+    assert any(
+        "open connection failed" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_open_connection_returns_none_on_http_error(monkeypatch):
+    class _Resp:
+        def raise_for_status(self):
+            raise daemon.requests.exceptions.HTTPError("500 server error")
+
+        def json(self):  # pragma: no cover - should not be reached
+            return {}
+
+    monkeypatch.setattr(
+        daemon.requests, "post", lambda url, headers, data, timeout: _Resp()
+    )
+    client = _FakeOpenClient(callbacks=["x"], event_required=False)
+
+    assert daemon._open_connection(client) is None
+
+
+class _FakeServeClient:
+    """Stand-in covering the surface _serve_stream_once touches on the SDK client."""
+
+    def __init__(self):
+        self.pre_start_called = False
+        self.background_payloads: list = []
+        self.keepalive_started = False
+        self.keepalive_cancelled = False
+        self.websocket = None
+
+    def pre_start(self):
+        self.pre_start_called = True
+
+    async def keepalive(self, _ws):
+        self.keepalive_started = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.keepalive_cancelled = True
+            raise
+
+    async def background_task(self, payload):
+        self.background_payloads.append(payload)
+
+
+class _FakeWebsocket:
+    def __init__(self, messages):
+        self._messages = list(messages)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        # Yield so background tasks scheduled by the loop can interleave.
+        await asyncio.sleep(0)
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+
+class _FakeConnectCM:
+    def __init__(self, ws_or_exc):
+        self._ws_or_exc = ws_or_exc
+
+    async def __aenter__(self):
+        if isinstance(self._ws_or_exc, BaseException):
+            raise self._ws_or_exc
+        return self._ws_or_exc
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+async def test_serve_stream_once_returns_none_when_open_connection_fails(monkeypatch):
+    monkeypatch.setattr(daemon, "_open_connection", lambda _client: None)
+    client = _FakeServeClient()
+
+    result = await daemon._serve_stream_once(client)
+
+    assert result is None
+    # pre_start still runs so SDK-internal token refresh / handler binding
+    # happens even on a failed cycle.
+    assert client.pre_start_called
+    # Never reached the websocket leg, so keepalive must not have started.
+    assert client.keepalive_started is False
+
+
+async def test_serve_stream_once_iterates_messages_and_returns_duration(monkeypatch):
+    import json as _json
+
+    monkeypatch.setattr(
+        daemon,
+        "_open_connection",
+        lambda _client: {"endpoint": "wss://gw", "ticket": "t/k+v"},
+    )
+
+    captured_uri: list[str] = []
+
+    def fake_connect(uri):
+        captured_uri.append(uri)
+        return _FakeConnectCM(
+            _FakeWebsocket([_json.dumps({"a": 1}), _json.dumps({"b": 2})])
+        )
+
+    monkeypatch.setattr(daemon.websockets, "connect", fake_connect)
+    client = _FakeServeClient()
+
+    result = await daemon._serve_stream_once(client)
+    # Background tasks are scheduled, not awaited, by _serve_stream_once;
+    # yield once so the assertions see them complete.
+    await asyncio.sleep(0)
+
+    assert result is not None and result >= 0
+    # The ticket is URL-quoted so '/' and '+' survive the round trip.
+    assert "ticket=t%2Fk%2Bv" in captured_uri[0]
+    assert captured_uri[0].startswith("wss://gw?ticket=")
+    assert client.keepalive_started
+    assert client.keepalive_cancelled
+    assert client.websocket is not None
+    assert client.background_payloads == [{"a": 1}, {"b": 2}]
+
+
+async def test_serve_stream_once_returns_none_when_handshake_raises(monkeypatch):
+    # websockets.connect() raising before __aenter__ returns means opened_at
+    # stays None — the function must report "never came up", not a duration of 0.
+    monkeypatch.setattr(
+        daemon,
+        "_open_connection",
+        lambda _client: {"endpoint": "wss://gw", "ticket": "t"},
+    )
+    monkeypatch.setattr(
+        daemon.websockets,
+        "connect",
+        lambda _uri: _FakeConnectCM(OSError("handshake failed")),
+    )
+    client = _FakeServeClient()
+
+    result = await daemon._serve_stream_once(client)
+
+    assert result is None
+    assert client.keepalive_started is False
+
+
+async def test_serve_stream_once_swallows_mid_stream_error_and_returns_duration(
+    monkeypatch, caplog
+):
+    import logging
+
+    monkeypatch.setattr(
+        daemon,
+        "_open_connection",
+        lambda _client: {"endpoint": "wss://gw", "ticket": "t"},
+    )
+
+    class _ErrorWS:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise RuntimeError("ws went bad")
+
+    monkeypatch.setattr(
+        daemon.websockets,
+        "connect",
+        lambda _uri: _FakeConnectCM(_ErrorWS()),
+    )
+    client = _FakeServeClient()
+
+    with caplog.at_level(logging.WARNING, logger="claude_dingtalk_bridge.daemon"):
+        result = await daemon._serve_stream_once(client)
+
+    # opened_at was set inside __aenter__ before the iterator raised, so the
+    # function reports the (very short) live duration — telling the outer
+    # backoff this was an "up then died" failure, not a never-connected one.
+    assert result is not None and result >= 0
+    assert any(
+        "stream connection error" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_serve_stream_once_propagates_cancel(monkeypatch):
+    monkeypatch.setattr(
+        daemon,
+        "_open_connection",
+        lambda _client: {"endpoint": "wss://gw", "ticket": "t"},
+    )
+
+    class _BlockingWS:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        daemon.websockets,
+        "connect",
+        lambda _uri: _FakeConnectCM(_BlockingWS()),
+    )
+    client = _FakeServeClient()
+
+    task = asyncio.create_task(daemon._serve_stream_once(client))
+    # Yield enough times to enter the async-for and block on __anext__.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    task.cancel()
+    import pytest
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Keepalive was started and must have been cancelled in the finally block.
+    assert client.keepalive_started
+    assert client.keepalive_cancelled

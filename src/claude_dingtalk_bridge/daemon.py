@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import signal
+import time
+from urllib.parse import quote_plus
 
 import dingtalk_stream
+import requests
 import websockets
 from dingtalk_stream import AckMessage
+from dingtalk_stream.stream import DingTalkStreamClient
+from dingtalk_stream.version import VERSION_STRING
 
 from claude_dingtalk_bridge.claude_runner import ClaudeRunner
 from claude_dingtalk_bridge.config import Config, load_config
@@ -17,11 +23,11 @@ from claude_dingtalk_bridge.images import download_image
 from claude_dingtalk_bridge.orchestrator import Orchestrator
 from claude_dingtalk_bridge.permissions import PermissionPolicy
 from claude_dingtalk_bridge.projects import ProjectRegistry
+from claude_dingtalk_bridge.stream_reconnect import ReconnectState
 
 logger = logging.getLogger(__name__)
 
-# Reconnect delay matches dingtalk_stream.start_forever's own 3s pause.
-_RECONNECT_DELAY = 3.0
+_OPEN_CONNECTION_TIMEOUT = (5.0, 10.0)  # connect, read
 
 
 def _disable_websocket_proxy() -> None:
@@ -355,22 +361,107 @@ def run() -> None:
         logger.info("Shutting down")
 
 
-async def _drive_stream_client(client) -> None:
-    """Run the stream client, reconnecting on transient errors.
+def _open_connection(client) -> dict | None:
+    """Request a Stream gateway endpoint with a request timeout.
 
-    Mirrors ``DingTalkStreamClient.start_forever``'s reconnect loop but as a
-    cancellable coroutine, so the surrounding ``_serve`` can race it against
-    a shutdown signal.
+    The SDK's own ``open_connection`` calls ``requests.post`` without a
+    timeout, so a half-dead network can block it indefinitely and starve
+    the reconnect loop.
     """
+    url = DingTalkStreamClient.OPEN_CONNECTION_API
+    logger.info("open connection, url=%s", url)
+    topics: list[dict] = []
+    if client._is_event_required:
+        topics.append({"type": "EVENT", "topic": "*"})
+    for topic in client.callback_handler_map.keys():
+        topics.append({"type": "CALLBACK", "topic": topic})
+    body = json.dumps({
+        "clientId": client.credential.client_id,
+        "clientSecret": client.credential.client_secret,
+        "subscriptions": topics,
+        "ua": f"dingtalk-sdk-python/v{VERSION_STRING}-union",
+        "localIp": client.get_host_ip(),
+    }).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    try:
+        resp = requests.post(
+            url,
+            headers=headers,
+            data=body,
+            timeout=_OPEN_CONNECTION_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("open connection failed: %s", e)
+        return None
+
+
+async def _serve_stream_once(client) -> float | None:
+    """Open the gateway and serve the websocket until it closes.
+
+    Single-pass — the daemon's outer loop owns retry/backoff policy, so the
+    SDK's own ``start()`` (which embeds a 10s flat retry that triggers
+    gateway lockouts) can't be used directly.
+
+    Returns the seconds the websocket stayed live, or ``None`` if the
+    connection never came up. Re-raises ``CancelledError``; logs and absorbs
+    all other failures so the outer loop just sees "no connection".
+    """
+    client.pre_start()
+    connection = await asyncio.to_thread(_open_connection, client)
+    if connection is None:
+        return None
+    logger.info("endpoint is %s", connection)
+    uri = f"{connection['endpoint']}?ticket={quote_plus(connection['ticket'])}"
+
+    opened_at: float | None = None
+    try:
+        async with websockets.connect(uri) as websocket:
+            opened_at = time.monotonic()
+            client.websocket = websocket
+            keepalive = asyncio.create_task(client.keepalive(websocket))
+            try:
+                async for raw in websocket:
+                    asyncio.create_task(
+                        client.background_task(json.loads(raw))
+                    )
+            finally:
+                keepalive.cancel()
+                with contextlib.suppress(BaseException):
+                    await keepalive
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning("stream connection error: %s", e)
+    if opened_at is None:
+        return None
+    return time.monotonic() - opened_at
+
+
+async def _drive_stream_client(
+    client,
+    *,
+    state: ReconnectState | None = None,
+) -> None:
+    """Run the stream client with exponential backoff between attempts.
+
+    Each cycle calls ``_serve_stream_once`` for one connection attempt and
+    feeds the result to ``ReconnectState``, which computes the next delay.
+    """
+    state = state or ReconnectState()
     while True:
         try:
-            await client.start()
+            duration = await _serve_stream_once(client)
         except asyncio.CancelledError:
             return
-        except Exception:  # noqa: BLE001 - one bad connection mustn't kill the loop
-            logger.exception("Stream client errored; reconnecting in %.0fs", _RECONNECT_DELAY)
+        except Exception:  # noqa: BLE001 - one bad pass mustn't kill the loop
+            logger.exception("Stream connection raised; treating as failure")
+            duration = None
+        delay = state.on_disconnect(duration)
+        logger.info("reconnect in %.1fs", delay)
         try:
-            await asyncio.sleep(_RECONNECT_DELAY)
+            await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
 
