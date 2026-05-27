@@ -65,6 +65,17 @@ def short_model_name(model: str) -> str:
     return _MODEL_VERSION_DASH.sub(r"\1.\2", name)
 
 
+def format_cost(cost: float) -> str:
+    """Render a USD cost compactly: $0.42, $22.40, $100.00.
+
+    Anything below one cent collapses to ``<$0.01`` so a nearly-free turn
+    doesn't read as ``$0.00`` (which looks like a stale or unfilled field).
+    """
+    if cost < 0.01:
+        return "<$0.01"
+    return f"${cost:.2f}"
+
+
 def format_tokens(n: int) -> str:
     """Render a token count compactly: 1.2K, 45K, 1.5M.
 

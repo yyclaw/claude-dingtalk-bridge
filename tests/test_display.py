@@ -3,6 +3,7 @@ from pathlib import Path
 from claude_dingtalk_bridge.display import (
     collapse_inline_paths,
     display_path,
+    format_cost,
     format_relative_time,
     format_size,
     md_escape,
@@ -33,6 +34,18 @@ def test_format_size_buckets():
     assert format_size(1023) == "1023B"
     assert format_size(38810) == "37.9KB"
     assert format_size(1258291) == "1.2MB"
+
+
+def test_format_cost_renders_dollars():
+    # Sub-cent amounts collapse to "<$0.01" — a turn that's effectively free
+    # should read that way, not "$0.00" (which looks like a stale field).
+    assert format_cost(0) == "<$0.01"
+    assert format_cost(0.001) == "<$0.01"
+    assert format_cost(0.009) == "<$0.01"
+    assert format_cost(0.01) == "$0.01"
+    assert format_cost(0.42) == "$0.42"
+    assert format_cost(22.4) == "$22.40"
+    assert format_cost(100) == "$100.00"
 
 
 def test_display_path_collapses_home_to_tilde():

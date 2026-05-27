@@ -6,6 +6,7 @@ import logging
 from typing import Awaitable, Callable
 
 from claude_dingtalk_bridge.claude_runner import (
+    aggregate_model_usage,
     MODEL_CHOICES,
     ResultEvent,
     TaskEvent,
@@ -30,6 +31,7 @@ from claude_dingtalk_bridge.questions import (
 )
 from claude_dingtalk_bridge.display import (
     display_path,
+    format_cost,
     format_tokens,
     md_escape,
     short_model_name,
@@ -463,8 +465,19 @@ class Orchestrator:
         if self._dry_run:
             lines.append("- **Debug:** on")
         tokens = self._runner.session_tokens(project.path)
-        if tokens:
-            lines.append(f"- **Session tokens:** {format_tokens(tokens)}")
+        session_cost = self._runner.session_cost(project.path)
+        if tokens or session_cost:
+            # Cost-first when the SDK fed us a billed amount — that's what the
+            # user actually cares about; tokens demote to a parenthetical so
+            # the volume context is still visible. Falls back to tokens-first
+            # when cost is unavailable (older SDK or aborted turn).
+            if session_cost > 0:
+                lines.append(
+                    f"- **Session cost:** ~{format_cost(session_cost)} "
+                    f"({format_tokens(tokens)} tokens)"
+                )
+            else:
+                lines.append(f"- **Session tokens:** {format_tokens(tokens)}")
             # Per-model sub-bullets are only useful when more than one model
             # ran (main + subagents); for a single-model session they would
             # just restate the parent line. Sorted by token count desc so the
@@ -485,25 +498,18 @@ class Orchestrator:
             # and the per-model sub-bullets add up to it.
             model_usage = self._runner.last_model_usage(project.path)
             if model_usage:
-                aggregate = {
-                    "input_tokens": sum(e.get("inputTokens", 0) for e in model_usage.values()),
-                    "output_tokens": sum(e.get("outputTokens", 0) for e in model_usage.values()),
-                    "cache_read_input_tokens": sum(e.get("cacheReadInputTokens", 0) for e in model_usage.values()),
-                    "cache_creation": {
-                        # model_usage has no 1h/5m split; lump all into 1h so
-                        # the parent line's "creation N" still matches the
-                        # sum of the per-model rows. The original 1h/5m split
-                        # for the main agent is still preserved in logs via
-                        # _log_cache_usage(usage).
-                        "ephemeral_1h_input_tokens": sum(e.get("cacheCreationInputTokens", 0) for e in model_usage.values()),
-                        "ephemeral_5m_input_tokens": 0,
-                    },
-                }
-                b = _cache_breakdown(aggregate)
+                b = _cache_breakdown(aggregate_model_usage(model_usage))
             else:
                 b = _cache_breakdown(usage)
+            last_turn_cost = self._runner.last_turn_cost(project.path)
+            cost_prefix = (
+                f"~{format_cost(last_turn_cost)} · "
+                if last_turn_cost is not None
+                else ""
+            )
             lines.append(
-                f"- **Cache last turn:** cached {b['read']} ({b['hit']}) · new {b['creation']}"
+                f"- **Cache last turn:** {cost_prefix}"
+                f"cached {b['read']} ({b['hit']}) · new {b['creation']}"
             )
             if model_usage and len(model_usage) > 1:
                 for model, entry in sorted(

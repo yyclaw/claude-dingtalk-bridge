@@ -62,6 +62,8 @@ class FakeRunner:
         self.usages: dict[str, dict] = {}
         self.model_token_totals: dict[str, dict[str, int]] = {}
         self.model_usages: dict[str, dict] = {}
+        self.session_costs: dict[str, float] = {}
+        self.last_turn_costs: dict[str, float | None] = {}
         self.model_override = None
         self.observed_model = None
         self.is_draining = False
@@ -100,6 +102,12 @@ class FakeRunner:
 
     def last_model_usage(self, project_path: str) -> dict | None:
         return self.model_usages.get(project_path)
+
+    def session_cost(self, project_path: str) -> float:
+        return self.session_costs.get(project_path, 0.0)
+
+    def last_turn_cost(self, project_path: str) -> float | None:
+        return self.last_turn_costs.get(project_path)
 
     async def interrupt(self) -> None:
         self.interrupts += 1
@@ -880,6 +888,90 @@ async def test_status_shows_per_model_breakdown():
     assert "**Cache last turn:** cached 45K (84.7%) · new 8K" in msg
     assert "  - opus-4.7[1m]: cached 45K (86.4%) · new 7K" in msg
     assert "  - haiku-4.5: cached 0 (0.0%) · new 1K" in msg
+
+
+async def test_status_cost_first_when_cost_available():
+    # Option B: when ResultMessage carries total_cost_usd, the parent line
+    # leads with dollars and demotes tokens to a parenthetical, and the cache
+    # line prefixes the turn's cost. Per-model sub-bullets keep showing
+    # tokens — SDK doesn't expose per-model cost.
+    runner = FakeRunner()
+    runner.token_totals["/tmp/multica"] = 7_700_000
+    runner.session_costs["/tmp/multica"] = 22.4
+    runner.last_turn_costs["/tmp/multica"] = 7.32
+    runner.usages["/tmp/multica"] = {
+        "cache_read_input_tokens": 2_100_000,
+        "cache_creation": {
+            "ephemeral_1h_input_tokens": 109_000,
+            "ephemeral_5m_input_tokens": 0,
+        },
+    }
+    orchestrator, runner, sent = build(runner)
+    await orchestrator.handle_message("/status", AUTHORIZED)
+    msg = "\n".join(sent)
+    assert "**Session cost:** ~$22.40 (7.7M tokens)" in msg
+    assert "**Cache last turn:** ~$7.32 · cached 2.1M" in msg
+    assert "Session tokens" not in msg
+
+
+async def test_status_cost_first_keeps_per_model_token_breakdown():
+    runner = FakeRunner()
+    runner.token_totals["/tmp/multica"] = 1_700_000
+    runner.session_costs["/tmp/multica"] = 5.0
+    runner.last_turn_costs["/tmp/multica"] = 1.25
+    runner.model_token_totals["/tmp/multica"] = {
+        "claude-opus-4-7": 1_100_000,
+        "claude-opus-4-7[1m]": 572_200,
+    }
+    runner.usages["/tmp/multica"] = {
+        "cache_read_input_tokens": 1_000_000,
+        "cache_creation": {
+            "ephemeral_1h_input_tokens": 64_100,
+            "ephemeral_5m_input_tokens": 0,
+        },
+    }
+    runner.model_usages["/tmp/multica"] = {
+        "claude-opus-4-7": {
+            "inputTokens": 10, "outputTokens": 200,
+            "cacheReadInputTokens": 700_000, "cacheCreationInputTokens": 40_000,
+        },
+        "claude-opus-4-7[1m]": {
+            "inputTokens": 5, "outputTokens": 100,
+            "cacheReadInputTokens": 300_000, "cacheCreationInputTokens": 24_100,
+        },
+    }
+    orchestrator, runner, sent = build(runner)
+    await orchestrator.handle_message("/status", AUTHORIZED)
+    msg = "\n".join(sent)
+    assert "**Session cost:** ~$5.00 (1.7M tokens)" in msg
+    # Per-model sub-bullets keep showing tokens, NOT a fake $-amount.
+    assert "  - opus-4.7: 1.1M" in msg
+    assert "  - opus-4.7[1m]: 572.2K" in msg
+    assert "  - opus-4.7: cached 700K" in msg
+    assert "  - opus-4.7[1m]: cached 300K" in msg
+
+
+async def test_status_session_cost_with_unknown_last_turn_cost():
+    # Earlier turns had cost but the latest didn't (SDK omitted it). Parent
+    # line still uses the session total; cache line drops the $ prefix so it
+    # doesn't lie about the unknown.
+    runner = FakeRunner()
+    runner.token_totals["/tmp/multica"] = 100_000
+    runner.session_costs["/tmp/multica"] = 0.42
+    runner.last_turn_costs["/tmp/multica"] = None
+    runner.usages["/tmp/multica"] = {
+        "cache_read_input_tokens": 50_000,
+        "cache_creation": {
+            "ephemeral_1h_input_tokens": 5000,
+            "ephemeral_5m_input_tokens": 0,
+        },
+    }
+    orchestrator, runner, sent = build(runner)
+    await orchestrator.handle_message("/status", AUTHORIZED)
+    msg = "\n".join(sent)
+    assert "**Session cost:** ~$0.42" in msg
+    assert "**Cache last turn:** cached 50K" in msg
+    assert "$ · cached" not in msg
 
 
 async def test_status_single_model_omits_breakdown():

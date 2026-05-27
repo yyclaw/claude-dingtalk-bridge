@@ -90,6 +90,28 @@ def _cache_breakdown(usage: dict) -> dict:
     }
 
 
+def aggregate_model_usage(model_usage: dict) -> dict:
+    """Sum a per-model camelCase usage dict into the snake_case shape
+    ``_cache_breakdown`` consumes — so the same renderer handles both the
+    main agent's ResultMessage.usage and the cross-model total. model_usage
+    carries no 1h/5m split, so all cache creation lumps into the 1h bucket.
+    """
+    entries = model_usage.values()
+    return {
+        "input_tokens": sum(e.get("inputTokens", 0) for e in entries),
+        "output_tokens": sum(e.get("outputTokens", 0) for e in entries),
+        "cache_read_input_tokens": sum(
+            e.get("cacheReadInputTokens", 0) for e in entries
+        ),
+        "cache_creation": {
+            "ephemeral_1h_input_tokens": sum(
+                e.get("cacheCreationInputTokens", 0) for e in entries
+            ),
+            "ephemeral_5m_input_tokens": 0,
+        },
+    }
+
+
 def _model_cache_breakdown(entry: dict) -> dict:
     """Pull cache numbers off a single model_usage entry.
 
@@ -1030,6 +1052,9 @@ class ClaudeRunner:
         # `usage`. Empty when a turn has no model_usage payload.
         self._session_model_tokens: dict[str, dict[str, int]] = {}
         self._last_model_usage: dict[str, dict] = {}
+        # last_turn is None when the SDK omits cost on a turn (unknown ≠ $0).
+        self._session_cost: dict[str, float] = {}
+        self._last_turn_cost: dict[str, float | None] = {}
         # Per-project monotonic turn id, scoped to the current session so the
         # count restarts at 1 whenever the session is cleared or switched.
         # Surfaced via log_context for grep-by-session-and-turn slicing.
@@ -1045,6 +1070,8 @@ class ClaudeRunner:
         self._last_usage.pop(project_path, None)
         self._session_model_tokens.pop(project_path, None)
         self._last_model_usage.pop(project_path, None)
+        self._session_cost.pop(project_path, None)
+        self._last_turn_cost.pop(project_path, None)
         self._turn_counts.pop(project_path, None)
 
     def set_session(self, project_path: str, session_id: str) -> None:
@@ -1055,6 +1082,8 @@ class ClaudeRunner:
         self._last_usage.pop(project_path, None)
         self._session_model_tokens.pop(project_path, None)
         self._last_model_usage.pop(project_path, None)
+        self._session_cost.pop(project_path, None)
+        self._last_turn_cost.pop(project_path, None)
         self._turn_counts.pop(project_path, None)
 
     def next_turn(self, project_path: str) -> int:
@@ -1084,6 +1113,15 @@ class ClaudeRunner:
     def last_model_usage(self, project_path: str) -> dict | None:
         """Raw model_usage dict from the project's most recent turn, if any."""
         return self._last_model_usage.get(project_path)
+
+    def session_cost(self, project_path: str) -> float:
+        """Cumulative USD cost of the project's current session."""
+        return self._session_cost.get(project_path, 0.0)
+
+    def last_turn_cost(self, project_path: str) -> float | None:
+        """USD cost of the project's most recent turn — None when the SDK
+        omitted total_cost_usd, so callers can distinguish unknown from $0."""
+        return self._last_turn_cost.get(project_path)
 
     def set_model(self, model: str | None) -> None:
         """Set (or clear, if None) the model override applied to subsequent turns."""
@@ -1132,6 +1170,7 @@ class ClaudeRunner:
         project_path: str,
         usage: dict | None,
         model_usage: dict | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         """Fold one turn's usage into the project's running token tally.
 
@@ -1160,6 +1199,9 @@ class ClaudeRunner:
                 bucket[model] = bucket.get(model, 0) + per_model_total
                 turn_total += per_model_total
         else:
+            # No model_usage this turn — drop any stale per-model snapshot so
+            # /status's "Cache last turn" doesn't show the prior turn's data.
+            self._last_model_usage.pop(project_path, None)
             turn_total = (
                 usage.get("input_tokens", 0)
                 + usage.get("output_tokens", 0)
@@ -1169,6 +1211,11 @@ class ClaudeRunner:
         self._session_tokens[project_path] = (
             self._session_tokens.get(project_path, 0) + turn_total
         )
+        self._last_turn_cost[project_path] = cost_usd
+        if cost_usd is not None:
+            self._session_cost[project_path] = (
+                self._session_cost.get(project_path, 0.0) + cost_usd
+            )
 
     async def interrupt(self) -> None:
         if self._active_client is not None:
@@ -1267,7 +1314,12 @@ class ClaudeRunner:
             await emit(event)
         if isinstance(message, ResultMessage):
             _log_cache_usage(message.usage)
-            self.record_usage(project_path, message.usage, message.model_usage)
+            self.record_usage(
+                project_path,
+                message.usage,
+                message.model_usage,
+                message.total_cost_usd,
+            )
             if message.session_id:
                 self._session_ids[project_path] = message.session_id
                 # The SDK occasionally rotates session_id mid-conversation;

@@ -468,6 +468,65 @@ def test_record_usage_without_model_usage_leaves_per_model_empty():
     assert runner.last_model_usage("/p") is None
 
 
+def test_record_usage_tracks_cost():
+    runner = ClaudeRunner()
+    runner.record_usage("/p", {"input_tokens": 1}, cost_usd=0.5)
+    assert runner.session_cost("/p") == 0.5
+    assert runner.last_turn_cost("/p") == 0.5
+    runner.record_usage("/p", {"input_tokens": 2}, cost_usd=1.5)
+    assert runner.session_cost("/p") == 2.0
+    assert runner.last_turn_cost("/p") == 1.5
+
+
+def test_session_cost_defaults_to_zero():
+    runner = ClaudeRunner()
+    assert runner.session_cost("/p") == 0.0
+    assert runner.last_turn_cost("/p") is None
+
+
+def test_record_usage_with_no_cost_leaves_totals_alone():
+    # SDK occasionally omits total_cost_usd (None). The session running tally
+    # must not break; we just don't have a number for that turn.
+    runner = ClaudeRunner()
+    runner.record_usage("/p", {"input_tokens": 1}, cost_usd=0.25)
+    runner.record_usage("/p", {"input_tokens": 2}, cost_usd=None)
+    assert runner.session_cost("/p") == 0.25
+    assert runner.last_turn_cost("/p") is None
+
+
+def test_reset_clears_cost_tally():
+    runner = ClaudeRunner()
+    runner.record_usage("/p", {"input_tokens": 1}, cost_usd=0.5)
+    runner.reset("/p")
+    assert runner.session_cost("/p") == 0.0
+    assert runner.last_turn_cost("/p") is None
+
+
+def test_set_session_clears_cost_tally():
+    runner = ClaudeRunner()
+    runner.record_usage("/p", {"input_tokens": 1}, cost_usd=0.5)
+    runner.set_session("/p", "new-id")
+    assert runner.session_cost("/p") == 0.0
+    assert runner.last_turn_cost("/p") is None
+
+
+def test_record_usage_clears_stale_last_model_usage():
+    # turn N carries model_usage, turn N+1 does not (SDK occasionally omits
+    # the field). last_model_usage must reflect turn N+1 — otherwise /status
+    # shows the prior turn's per-model breakdown as if it were the latest.
+    runner = ClaudeRunner()
+    runner.record_usage(
+        "/p", {"input_tokens": 1},
+        model_usage={"claude-opus-4-7": {
+            "inputTokens": 1, "outputTokens": 0,
+            "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+        }},
+    )
+    assert runner.last_model_usage("/p") is not None
+    runner.record_usage("/p", {"input_tokens": 2})
+    assert runner.last_model_usage("/p") is None
+
+
 def test_reset_clears_per_model_state():
     runner = ClaudeRunner()
     runner.record_usage(
@@ -2204,6 +2263,28 @@ async def _run_turn_with(monkeypatch, script, timeout=None, settle=None):
 
     await runner.run_turn("/tmp/p", "go", emit)
     return runner, events
+
+
+async def test_consume_result_message_records_cost_from_total_cost_usd():
+    # Wires ResultMessage.total_cost_usd into record_usage so /status's
+    # cost line reflects the SDK's authoritative billed amount, not 0.
+    from claude_agent_sdk import ResultMessage
+
+    runner = ClaudeRunner()
+    msg = ResultMessage(
+        subtype="success",
+        duration_ms=100, duration_api_ms=80,
+        is_error=False, num_turns=1, session_id="s1",
+        usage={"input_tokens": 10, "output_tokens": 5},
+        total_cost_usd=0.75,
+    )
+
+    async def emit(event):
+        pass
+
+    await runner._consume(msg, "/tmp/p", emit, set(), {}, set())
+    assert runner.session_cost("/tmp/p") == 0.75
+    assert runner.last_turn_cost("/tmp/p") == 0.75
 
 
 async def test_consume_updates_log_context_session_before_logging_init(monkeypatch):
