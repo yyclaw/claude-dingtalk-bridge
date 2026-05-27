@@ -2064,10 +2064,10 @@ __CSS__
   </div>
   <div class="row">
     <input id="q" type="search" placeholder="filter (active source)…">
-    <button id="expand">expand all</button>
-    <button id="collapse">collapse all</button>
-    <button id="clear">clear view</button>
-    <button id="legend" title="Verb / chip legend">verbs info</button>
+    <button id="expand">Expand all</button>
+    <button id="collapse">Collapse all</button>
+    <button id="clear">Clear view</button>
+    <button id="legend" title="Verb / chip legend">Verb chips</button>
   </div>
 </div>
 <div id="legend-modal" class="hidden" aria-hidden="true">
@@ -2178,7 +2178,7 @@ __CSS__
     <p class="legend-intro">
       Tips: <code>Command + click</code> an entry's header to toggle between
       the rendered view and the raw log line;
-      <code>expand all</code> / <code>collapse all</code> folds every entry's
+      <code>Expand all</code> / <code>Collapse all</code> folds every entry's
       body; the 4px left border colour is hashed from the session id so
       entries from the same session share a colour.
     </p>
