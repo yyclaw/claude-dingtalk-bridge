@@ -1913,26 +1913,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         q = tail.subscribe()
         try:
-            last_beat = time.time()
             while True:
+                # Block up to 15s; either a real message arrives, or the
+                # timeout doubles as the keep-alive ping deadline.
                 try:
-                    msg = q.get(timeout=1.0)
+                    msg = q.get(timeout=15.0)
                 except queue.Empty:
-                    msg = None
-                if msg is not None:
-                    payload = json.dumps(msg)
-                    try:
-                        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError):
-                        return
-                if time.time() - last_beat > 15:
                     try:
                         self.wfile.write(b": ping\n\n")
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError):
                         return
-                    last_beat = time.time()
+                    continue
+                payload = json.dumps(msg)
+                try:
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
         finally:
             tail.unsubscribe(q)
 
