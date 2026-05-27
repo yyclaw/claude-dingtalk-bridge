@@ -93,12 +93,49 @@ def test_bash_empty_command_escalates():
     assert make_policy().evaluate("Bash", {"command": ""}, PROJECT) is Decision.ESCALATE
 
 
-def test_is_within_returns_false_when_path_resolution_errors(monkeypatch):
-    # A path that cannot be resolved (OSError/RuntimeError) must deny, not crash.
+def test_edit_escalates_when_project_path_resolution_errors(monkeypatch):
+    # A project_path that cannot be resolved (OSError/RuntimeError) must deny,
+    # not crash.
     from claude_dingtalk_bridge import permissions
 
     def boom(self, *args, **kwargs):
         raise OSError("cannot resolve")
 
     monkeypatch.setattr(permissions.Path, "resolve", boom)
-    assert permissions._is_within("/some/file", "/some") is False
+    assert make_policy().evaluate("Edit", {"file_path": "/x/y"}, PROJECT) is Decision.ESCALATE
+
+
+def test_edit_escalates_when_target_path_resolution_errors(monkeypatch):
+    # Resolve fine for project base, raise for the target file.
+    from claude_dingtalk_bridge import permissions
+
+    real_resolve = permissions.Path.resolve
+    calls = {"n": 0}
+
+    def boom_after_base(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_resolve(self, *args, **kwargs)
+        raise RuntimeError("cannot resolve symlink loop")
+
+    monkeypatch.setattr(permissions.Path, "resolve", boom_after_base)
+    assert make_policy().evaluate("Edit", {"file_path": "/x/y"}, PROJECT) is Decision.ESCALATE
+
+
+def test_edit_reuses_cached_project_resolve(monkeypatch):
+    # Repeated edits with the same project_path must only resolve the base once.
+    from claude_dingtalk_bridge import permissions
+
+    real_resolve = permissions.Path.resolve
+    base_calls = []
+
+    def counting_resolve(self, *args, **kwargs):
+        if str(self) == PROJECT:
+            base_calls.append(str(self))
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(permissions.Path, "resolve", counting_resolve)
+    policy = make_policy()
+    policy.evaluate("Edit", {"file_path": "/tmp/proj/a.py"}, PROJECT)
+    policy.evaluate("Edit", {"file_path": "/tmp/proj/b.py"}, PROJECT)
+    assert len(base_calls) == 1
