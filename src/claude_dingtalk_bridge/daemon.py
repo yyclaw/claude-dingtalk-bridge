@@ -242,22 +242,27 @@ class _ChatHandler(dingtalk_stream.ChatbotHandler):
             if text:
                 await self._orchestrator.handle_message(text, msg.sender_staff_id)
             return
-        parts: list[tuple[str, str]] = []
-        for kind, value in raw_parts:
-            if kind == "image":
-                try:
-                    value = await asyncio.to_thread(self._fetch_image, value)
-                except Exception as exc:  # noqa: BLE001 - surface to phone, not silent
-                    # Without this branch the upstream `except` in process()
-                    # would swallow the failure and the user would see nothing
-                    # at all for their image message.
-                    logger.warning("Image download failed: %s", exc)
-                    await self._orchestrator.notify(
-                        f"📷 Couldn't download an image from your message.  \n"
-                        f"`{type(exc).__name__}: {exc}`"
-                    )
-                    return
-            parts.append((kind, value))
+        # Download all images concurrently; richText messages with multiple
+        # pictures would otherwise pay N× single-image latency.
+        parts: list[tuple[str, str]] = list(raw_parts)
+        image_indices = [i for i, (kind, _) in enumerate(parts) if kind == "image"]
+        results = await asyncio.gather(
+            *(asyncio.to_thread(self._fetch_image, parts[i][1]) for i in image_indices),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, Exception):
+                # Without this branch the upstream `except` in process() would
+                # swallow the failure and the user would see nothing for their
+                # image message.
+                logger.warning("Image download failed: %s", result)
+                await self._orchestrator.notify(
+                    f"📷 Couldn't download an image from your message.  \n"
+                    f"`{type(result).__name__}: {result}`"
+                )
+                return
+        for idx, path in zip(image_indices, results):
+            parts[idx] = ("image", path)
         await self._orchestrator.handle_image(
             build_image_prompt(parts), msg.sender_staff_id
         )
