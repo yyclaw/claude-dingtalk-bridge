@@ -138,6 +138,10 @@ Before each turn, the daemon checks the exit IP's country code against the value
 ### Phone-side kill switch
 Send `/stop` from your phone to interrupt the current turn, or `/clear` to reset the whole session — if a task runs off the rails, the brake is always within reach.
 
+## Efficiency
+
+Prompt caching is optimized for the slower, phone-driven rhythm. The `claude_code` preset normally injects dynamic sections (e.g., git status) into the system prompt, causing the cached prefix to change every turn. The daemon strips these sections to keep the prefix byte‑stable. Since phone turns are typically minutes apart, the default 5‑minute cache window is almost always cold — so the daemon switches to a 1‑hour TTL instead. `/status` exposes the running token tally along with the cache read/write breakdown from the last turn, keeping the hit rate visible.
+
 ## More commands
 
 All operations are wrapped in the `Makefile`; run `make` with no arguments to

@@ -120,6 +120,10 @@ make daemon-start
 ### 随时能踩刹车
 手机发 `/stop` 立刻中断当前 turn、`/clear` 重置整个会话 — 任务跑飞了你随时能拉手刹。
 
+## 效率优化
+
+Prompt cache 针对手机驱动的节奏做了两处调优。`claude_code` preset 默认会把 git status 等动态段塞进 system prompt，每个 turn 前缀都在变，缓存前缀根本复用不上——Daemon 把这些动态段剔除，让前缀字节级稳定。再加上手机两次 turn 之间往往隔好几分钟，默认 5 分钟缓存窗口大概率已经冷掉，于是切到 1 小时 TTL。`/status` 会展示累计 token 与上一次 turn 的 cache 读 / 写明细，命中率随时可查。
+
 ## 更多命令
 
 所有操作都封装在 `Makefile` 里；不带参数运行 `make` 即可列出全部。
