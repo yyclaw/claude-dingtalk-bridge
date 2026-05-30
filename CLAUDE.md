@@ -12,7 +12,7 @@ Code turns and escalates risky operations back to the phone for approval.
 `make` (no args) lists everything. Key ones:
 
 - `make setup` — create `.venv`, `pip install -e ".[dev]"`
-- `make test` — `pytest -q`
+- `make test` — `pytest -q --cov` (with a branch-coverage summary)
 - `make daemon-*` — launchd lifecycle (install/uninstall/start/stop/restart/status)
 - `make logs-tail` — tail daemon logs; `make logs-web ARGS=...` — browser live-viewer
   (`scripts/log_server.py`, date-range filtering via `--since`/`--until`)
@@ -69,10 +69,9 @@ Single-threaded async coordinator holding all mutable session state.
 
 The bridge's config carries only a `deny` list — there is no user-configurable
 allow list. Edit-shaped tools (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`) are
-auto-allowed inside the active project root (an edit whose target *resolves*
-outside the root — or inside `.git`/`.claude` — still escalates, see the
-edit-path hook below); everything else falls through to the phone prompt. Three layers gate each tool call, in
-SDK pipeline order:
+auto-allowed inside the active project root (with exceptions — see the edit-path
+hook below); everything else falls through to the phone prompt. Three layers gate
+each tool call, in SDK pipeline order:
 
 1. **PreToolUse hooks** — run before settings-layer resolution, so a decision
    here cannot be short-circuited by an allow rule in any settings layer. Both
@@ -164,8 +163,8 @@ DingTalk REST push stays direct. No `geo` section → all of this is off.
 
 The orchestrator holds a `projects.ProjectRegistry` of the configured projects
 and an active `_current_project` (defaults to the first in config); `/cd <name>`
-switches it. Each project path keeps its own session, so switching is a context
-swap, not a reset.
+switches it. `/cd` resets the target project's session (and its usage tallies)
+via `runner.reset`, so a switch starts that project fresh.
 
 `ClaudeRunner` keeps a Claude session ID per project path and passes it as
 `resume` next turn, giving each project a continuous conversation. Sticky until
@@ -189,9 +188,10 @@ bundle (Info.plist, ad-hoc-signed) with the agent plist nested at
 `Contents/Library/LaunchAgents/` and a Swift helper (`resources/AppHelper.swift`,
 compiled at install via `xcrun swiftc`) that registers the service through
 SMAppService and execs the daemon. Install failures usually trace to a missing
-`xcode-select` toolchain. `make daemon-start/stop/restart` go through `launchctl
-kickstart`/`bootstrap`/`bootout` on `gui/<uid>/<label>` — never touch
-`~/Library/LaunchAgents` by hand.
+`xcode-select` toolchain. `make daemon-start` runs `launchctl kickstart` on
+`gui/<uid>/<label>` (falling back to `bootstrap gui/<uid> <plist>` when the
+service was booted out), `stop` runs `bootout`, and `restart` runs `kickstart
+-k` — never touch `~/Library/LaunchAgents` by hand.
 
 `cli.py._notify_phone` pushes a notice on `start`/`stop`/`restart`. The daemon
 can't tell stop from restart (both arrive as SIGTERM), so these labels live at
