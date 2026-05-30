@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "claude-dingtalk-bridge" / "config.yaml"
+CACHE_DIR = Path.home() / "Library" / "Caches" / "claude-dingtalk-bridge"
 
 
 class ConfigError(Exception):
@@ -20,9 +21,7 @@ class Project:
 
 @dataclass
 class PermissionRules:
-    allowed_tools: list[str]
-    allowed_bash: list[str]
-    allow_edits_in_project: bool
+    deny: list[str]
 
 
 @dataclass
@@ -67,9 +66,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         ]
         perms_raw = raw.get("permissions", {}) or {}
         perms = PermissionRules(
-            allowed_tools=list(perms_raw.get("allowed_tools", ["Read", "Glob", "Grep"])),
-            allowed_bash=list(perms_raw.get("allowed_bash", [])),
-            allow_edits_in_project=bool(perms_raw.get("allow_edits_in_project", True)),
+            deny=[str(x) for x in perms_raw.get("deny", [])],
         )
         geo = None
         if "geo" in raw:

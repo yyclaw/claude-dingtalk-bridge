@@ -18,7 +18,9 @@ class CommandType(Enum):
     HELP = auto()
     SESSION = auto()
     RESUME = auto()  # arg: number index | session id | None
-    MODEL = auto()  # arg: list index | model name | None (None → list models)
+    MODEL = auto()  # arg: model name | None (None → list models)
+    MODE = auto()  # arg: "default" | "acceptEdits" | "bypassPermissions" |
+    # "plan" | "reset" | None (None → report current state)
     UNKNOWN = auto()
     PROMPT = auto()
 
@@ -47,6 +49,7 @@ _ARG_COMMANDS: dict[str, CommandType] = {
     "/debug": CommandType.DEBUG,
     "/resume": CommandType.RESUME,
     "/model": CommandType.MODEL,
+    "/mode": CommandType.MODE,
 }
 
 # Slash commands forwarded verbatim to Claude as SDK-dispatchable commands.
@@ -57,17 +60,24 @@ _REPLY_KEYWORDS: dict[str, CommandType] = {
     "ok": CommandType.APPROVE,
     "yes": CommandType.APPROVE,
     "approve": CommandType.APPROVE,
+    "\U0001f44c": CommandType.APPROVE,  # 👌
+    "\u274c": CommandType.DENY,  # ❌
     "no": CommandType.DENY,
     "deny": CommandType.DENY,
     "reject": CommandType.DENY,
 }
 
+# Skin-tone modifiers (U+1F3FB–U+1F3FF) and the emoji variation selector ride on
+# a base emoji; stripping them lets every 👌 variant match the bare 👌 keyword.
+_EMOJI_MODIFIERS = dict.fromkeys([*range(0x1F3FB, 0x1F400), 0xFE0F])
+
 
 def parse_command(text: str) -> Command:
     stripped = text.strip()
     lowered = stripped.lower()
-    if lowered in _REPLY_KEYWORDS:
-        return Command(_REPLY_KEYWORDS[lowered])
+    reply_key = lowered.translate(_EMOJI_MODIFIERS)
+    if reply_key in _REPLY_KEYWORDS:
+        return Command(_REPLY_KEYWORDS[reply_key])
     if lowered in _SLASH_KEYWORDS:
         return Command(_SLASH_KEYWORDS[lowered])
     parts = stripped.split(maxsplit=1)

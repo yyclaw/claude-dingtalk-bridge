@@ -11,6 +11,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookEventMessage,
+    HookMatcher,
     MirrorErrorMessage,
     RateLimitEvent,
     ResultMessage,
@@ -27,8 +28,16 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
+from pathlib import Path
+
 from claude_dingtalk_bridge import log_context
+from claude_dingtalk_bridge.config import PermissionRules
 from claude_dingtalk_bridge.display import collapse_inline_paths, display_path, format_tokens
+from claude_dingtalk_bridge.permission_hooks import (
+    make_bash_permission_hook,
+    make_edit_path_hook,
+)
+from claude_dingtalk_bridge.permissions import write_permission_settings_file
 from claude_dingtalk_bridge.questions import question_preview
 
 logger = logging.getLogger(__name__)
@@ -44,17 +53,6 @@ _STUCK_TIMEOUT = 180.0
 # capture is a straggler relay turn for one of them. If no new SDK message
 # arrives for this long, the stream has settled and drain exits silently.
 _SETTLE_TIMEOUT = 15.0
-
-# Curated model list for the /model command. Mirrors the aliases the Claude
-# CLI accepts for --model; only aliases (no version numbers) so it needn't
-# change as models are bumped. Each entry is (alias, short description).
-MODEL_CHOICES: list[tuple[str, str]] = [
-    ("default", "recommended"),
-    ("opus", "most capable"),
-    ("sonnet", "balanced"),
-    ("haiku", "fastest"),
-]
-
 
 def _short_tool_id(full: str | None) -> str | None:
     """Trim the constant `toolu_` prefix and keep the 8 chars that actually vary."""
@@ -1036,6 +1034,8 @@ class ClaudeRunner:
 
     def __init__(self):
         self.permission_handler: PermissionHandler | None = None
+        self.permission_rules: PermissionRules | None = None
+        self.settings_file_path: Path | None = None
         self.question_handler: QuestionHandler | None = None
         self._session_ids: dict[str, str] = {}
         self._active_client: ClaudeSDKClient | None = None
@@ -1063,6 +1063,9 @@ class ClaudeRunner:
         # the SDK init message — both global, not persisted to config.
         self._model: str | None = None
         self._observed_model: str | None = None
+        # Runtime permission_mode override set via /mode. None = don't pass
+        # --permission-mode to the CLI, so settings-layer defaults apply.
+        self._permission_mode: str | None = None
 
     def reset(self, project_path: str) -> None:
         self._session_ids.pop(project_path, None)
@@ -1129,8 +1132,22 @@ class ClaudeRunner:
 
     @property
     def model_override(self) -> str | None:
-        """The model override set via set_model, or None for the SDK default."""
+        """The model override set via set_model, or None for the Agent SDK default."""
         return self._model
+
+    def set_permission_mode(self, mode: str | None) -> None:
+        """Set (or clear, if None) the SDK permission_mode for subsequent turns.
+
+        ``None`` omits ``--permission-mode`` entirely so any ``defaultMode``
+        in the settings layers gets to apply; a literal ``"default"`` is
+        forwarded as-is and overrides that.
+        """
+        self._permission_mode = mode
+
+    @property
+    def permission_mode(self) -> str | None:
+        """The permission_mode override set via set_permission_mode, or None."""
+        return self._permission_mode
 
     @property
     def observed_model(self) -> str | None:
@@ -1247,11 +1264,18 @@ class ClaudeRunner:
             cached = self._session_ids.get(project_path)
             if cached:
                 log_context.set_session(cached)
+            # AskUserQuestion's answer rides back through PermissionResultDeny.message,
+            # which the model reads as the tool result.
             if tool_name == "AskUserQuestion" and self.question_handler is not None:
                 answer = await self.question_handler(input_data, project_path)
                 return PermissionResultDeny(message=answer, interrupt=False)
+            # The CLI only sends a can_use_tool request when the PreToolUse
+            # hook and the settings layer (allow/deny rules) couldn't decide.
+            # By then there's nothing left to consult — ask the phone.
             assert self.permission_handler is not None
-            approved = await self.permission_handler(tool_name, input_data, project_path)
+            approved = await self.permission_handler(
+                tool_name, input_data, project_path
+            )
             if approved:
                 return PermissionResultAllow()
             return PermissionResultDeny(
@@ -1267,11 +1291,36 @@ class ClaudeRunner:
             "preset": "claude_code",
             "exclude_dynamic_sections": True,
         }
+        # Re-render per turn — the in-project edit allow expands to
+        # Edit(<cwd>/**) so the file changes whenever /cd switches projects.
+        if self.permission_rules is not None and self.settings_file_path is not None:
+            write_permission_settings_file(
+                self.permission_rules, project_path, self.settings_file_path
+            )
+            kwargs["settings"] = str(self.settings_file_path)
+        kwargs["hooks"] = {
+            "PreToolUse": [
+                HookMatcher(
+                    matcher="Bash",
+                    hooks=[
+                        make_bash_permission_hook(
+                            self.permission_rules, project_path
+                        )
+                    ],
+                ),
+                HookMatcher(
+                    matcher="Edit|Write|MultiEdit|NotebookEdit",
+                    hooks=[make_edit_path_hook(project_path)],
+                ),
+            ],
+        }
         session_id = self._session_ids.get(project_path)
         if session_id:
             kwargs["resume"] = session_id
         if self._model:
             kwargs["model"] = self._model
+        if self._permission_mode:
+            kwargs["permission_mode"] = self._permission_mode
         # Force the 1-hour prompt cache TTL — phone turns are minutes apart,
         # so the default 5-minute window is almost always cold.
         # Override the SDK's default "sdk-py" entrypoint so daemon-produced

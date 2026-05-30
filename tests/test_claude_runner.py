@@ -1,4 +1,7 @@
+import json
+
 from claude_dingtalk_bridge.claude_runner import ClaudeRunner, tool_summary
+from claude_dingtalk_bridge.config import PermissionRules
 
 
 def test_tool_summary_for_bash():
@@ -605,6 +608,34 @@ def test_build_options_passes_model_when_set():
     runner.set_model("sonnet")
     options = runner._build_options("/tmp/proj")
     assert options.model == "sonnet"
+
+
+def test_permission_mode_default_none():
+    runner = ClaudeRunner()
+    assert runner.permission_mode is None
+
+
+def test_set_permission_mode_updates_override():
+    runner = ClaudeRunner()
+    runner.set_permission_mode("acceptEdits")
+    assert runner.permission_mode == "acceptEdits"
+    runner.set_permission_mode(None)
+    assert runner.permission_mode is None
+
+
+def test_build_options_omits_permission_mode_by_default():
+    runner = ClaudeRunner()
+    options = runner._build_options("/tmp/proj")
+    # When unset, leaving the flag off lets the settings layer's defaultMode
+    # (if any) apply.
+    assert getattr(options, "permission_mode", None) is None
+
+
+def test_build_options_passes_permission_mode_when_set():
+    runner = ClaudeRunner()
+    runner.set_permission_mode("plan")
+    options = runner._build_options("/tmp/proj")
+    assert options.permission_mode == "plan"
 
 
 async def test_note_system_message_captures_model():
@@ -2537,6 +2568,27 @@ async def test_can_use_tool_denies_when_permission_handler_rejects():
     assert result.interrupt is False
 
 
+async def test_can_use_tool_falls_through_to_handler_on_ask():
+    # Tool not covered by any rule -> phone (permission_handler) decides.
+    from claude_agent_sdk import PermissionResultAllow
+
+    runner = ClaudeRunner()
+    runner.permission_rules = PermissionRules(deny=[])
+    called = []
+
+    async def permission_handler(tool_name, input_data, project_path):
+        called.append(tool_name)
+        return True
+
+    runner.permission_handler = permission_handler
+    options = runner._build_options("/tmp/proj")
+    result = await options.can_use_tool(
+        "Bash", {"command": "make test"}, None
+    )
+    assert isinstance(result, PermissionResultAllow)
+    assert called == ["Bash"]  # handler invoked because no rule matched
+
+
 # --- branch-coverage backfill: untested false-side branches -------------
 
 
@@ -3059,3 +3111,46 @@ async def test_drain_returns_when_cancel_set_after_consume(monkeypatch):
     assert not any(
         isinstance(e, TaskEvent) and e.phase == "timeout" for e in events
     )
+
+
+def _perm_rules() -> PermissionRules:
+    return PermissionRules(deny=["Bash(rm -rf:*)"])
+
+
+def test_build_options_writes_settings_file_and_passes_path(tmp_path):
+    runner = ClaudeRunner()
+    runner.permission_rules = _perm_rules()
+    runner.settings_file_path = tmp_path / "perms.json"
+    options = runner._build_options("/Users/me/proj")
+    assert options.settings == str(tmp_path / "perms.json")
+    payload = json.loads((tmp_path / "perms.json").read_text())
+    allow = payload["permissions"]["allow"]
+    assert "Edit(/Users/me/proj/**)" in allow
+    assert payload["permissions"]["deny"] == ["Bash(rm -rf:*)"]
+
+
+def test_build_options_registers_pretooluse_hook(tmp_path):
+    runner = ClaudeRunner()
+    runner.permission_rules = _perm_rules()
+    runner.settings_file_path = tmp_path / "perms.json"
+    options = runner._build_options("/Users/me/proj")
+    assert options.hooks is not None
+    matchers = options.hooks.get("PreToolUse") or []
+    assert any(m.matcher == "Bash" for m in matchers), (
+        "Bridge must register a PreToolUse hook matched on Bash for the "
+        "metacharacter check; without it, settings.json allow rules can "
+        "short-circuit the bridge's escalation."
+    )
+
+
+def test_build_options_regenerates_settings_per_cwd(tmp_path):
+    runner = ClaudeRunner()
+    runner.permission_rules = _perm_rules()
+    runner.settings_file_path = tmp_path / "perms.json"
+    runner._build_options("/Users/me/proj-A")
+    a = json.loads((tmp_path / "perms.json").read_text())
+    runner._build_options("/Users/me/proj-B")
+    b = json.loads((tmp_path / "perms.json").read_text())
+    assert "Edit(/Users/me/proj-A/**)" in a["permissions"]["allow"]
+    assert "Edit(/Users/me/proj-A/**)" not in b["permissions"]["allow"]
+    assert "Edit(/Users/me/proj-B/**)" in b["permissions"]["allow"]

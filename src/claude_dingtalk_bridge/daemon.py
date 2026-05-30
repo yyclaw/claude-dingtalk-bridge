@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import signal
 import time
 from urllib.parse import quote_plus
@@ -16,12 +17,12 @@ from dingtalk_stream.stream import DingTalkStreamClient
 from dingtalk_stream.version import VERSION_STRING
 
 from claude_dingtalk_bridge.claude_runner import ClaudeRunner
-from claude_dingtalk_bridge.config import Config, load_config
+from claude_dingtalk_bridge.config import CACHE_DIR, Config, load_config
 from claude_dingtalk_bridge.dingtalk import DingTalkTransport
+from claude_dingtalk_bridge.display import display_path
 from claude_dingtalk_bridge.geo import CachedGeoCheck
 from claude_dingtalk_bridge.images import download_image
 from claude_dingtalk_bridge.orchestrator import Orchestrator
-from claude_dingtalk_bridge.permissions import PermissionPolicy
 from claude_dingtalk_bridge.projects import ProjectRegistry
 from claude_dingtalk_bridge.stream_reconnect import ReconnectState
 
@@ -83,9 +84,27 @@ def _filter_client_noise() -> None:
     logging.getLogger("dingtalk_stream.client").addFilter(_Filter())
 
 
+_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*$")
+
+
+def _extract_title(text: str) -> str | None:
+    """Lift the first heading line as the DingTalk markdown title.
+
+    The title is what shows in the chat-list preview; we leave the `###`
+    line in the body so the on-screen header stays visible. Stops at the
+    first non-empty line — only a leading heading counts.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = _HEADING_RE.match(stripped)
+        return match.group(1).strip() if match else None
+    return None
+
+
 def build_orchestrator(config: Config) -> tuple[Orchestrator, DingTalkTransport]:
     registry = ProjectRegistry(config.projects)
-    policy = PermissionPolicy(config.permissions)
     transport = DingTalkTransport(config.dingtalk_client_id, config.dingtalk_client_secret)
     user_id = config.authorized_user_id
 
@@ -93,9 +112,12 @@ def build_orchestrator(config: Config) -> tuple[Orchestrator, DingTalkTransport]
         await asyncio.to_thread(transport.send_text, user_id, text)
 
     async def send_markdown(text: str) -> None:
-        await asyncio.to_thread(transport.send_markdown, user_id, "Claude", text)
+        title = _extract_title(text) or "Claude has replied."
+        await asyncio.to_thread(transport.send_markdown, user_id, title, text)
 
     runner = ClaudeRunner()
+    runner.permission_rules = config.permissions
+    runner.settings_file_path = CACHE_DIR / "permissions.json"
 
     geo_check = None
     if config.geo is not None:
@@ -108,7 +130,6 @@ def build_orchestrator(config: Config) -> tuple[Orchestrator, DingTalkTransport]
     orchestrator = Orchestrator(
         config=config,
         registry=registry,
-        policy=policy,
         runner=runner,
         send=send,
         send_markdown=send_markdown,
@@ -129,7 +150,7 @@ def build_image_prompt(parts: list[tuple[str, str]]) -> str:
     """
     has_text = any(kind == "text" for kind, _ in parts)
     rendered = " ".join(
-        value if kind == "text" else f"[image saved at {value}]"
+        value if kind == "text" else f"[image saved at {display_path(value)}]"
         for kind, value in parts
     )
     if has_text:
@@ -208,7 +229,7 @@ class _ChatHandler(dingtalk_stream.ChatbotHandler):
                 )
                 if self._orchestrator.is_authorized(msg.sender_staff_id):
                     await self._orchestrator.notify(
-                        f"🤔 Got a `{msg.message_type}` message — I can only "
+                        f"🤔 Got a {msg.message_type} message — I can only "
                         f"handle text, voice, and images."
                     )
         except Exception:  # noqa: BLE001 - never let one bad message kill the loop
@@ -263,8 +284,8 @@ class _ChatHandler(dingtalk_stream.ChatbotHandler):
                 # image message.
                 logger.warning("Image download failed: %s", result)
                 await self._orchestrator.notify(
-                    f"📷 Couldn't download an image from your message.  \n"
-                    f"`{type(result).__name__}: {result}`"
+                    f"📷 Couldn't download an image from your message.\n"
+                    f"{type(result).__name__}: {result}"
                 )
                 return
         for idx, path in zip(image_indices, results):

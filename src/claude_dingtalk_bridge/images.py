@@ -8,6 +8,8 @@ from pathlib import Path
 
 import requests
 
+from claude_dingtalk_bridge.config import CACHE_DIR
+
 # Extension by Content-Type — DingTalk serves images over a generic URL, so the
 # response header is the only reliable hint. Anything unrecognized falls to PNG.
 _EXT_BY_CONTENT_TYPE = {
@@ -21,7 +23,7 @@ _EXT_BY_CONTENT_TYPE = {
 # Cache attachments under the user's home, not the shared system temp dir: a
 # stable path in /tmp invites a symlink pre-creation attack and leaves the
 # files readable by every local user. The directory is created owner-only.
-_IMAGE_DIR = Path.home() / "Library" / "Caches" / "claude-dingtalk-bridge"
+_IMAGE_DIR = CACHE_DIR
 
 # Cap a single download so a malicious or broken sender cannot exhaust memory
 # or disk — ample for a phone photo, far below anything alarming.

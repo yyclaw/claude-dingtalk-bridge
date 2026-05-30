@@ -13,9 +13,8 @@ projects:
   - name: multica
     path: ~/Projects/marmot-multica
 permissions:
-  allow_edits_in_project: true
-  allowed_tools: [Read, Grep]
-  allowed_bash: ["git status"]
+  deny:
+    - "Bash(rm -rf:*)"
 permission_timeout_seconds: 300
 """
 
@@ -30,9 +29,7 @@ def test_load_valid_config(write_config):
     assert len(config.projects) == 1
     assert config.projects[0].name == "multica"
     assert config.projects[0].path == str(Path("~/Projects/marmot-multica").expanduser())
-    assert config.permissions.allowed_tools == ["Read", "Grep"]
-    assert config.permissions.allowed_bash == ["git status"]
-    assert config.permissions.allow_edits_in_project is True
+    assert config.permissions.deny == ["Bash(rm -rf:*)"]
 
 
 def test_missing_file_raises(tmp_path):
@@ -70,8 +67,7 @@ projects:
 """
     config = load_config(write_config(minimal))
     assert config.permission_timeout_seconds == 600
-    assert config.permissions.allowed_tools == ["Read", "Glob", "Grep"]
-    assert config.permissions.allow_edits_in_project is True
+    assert config.permissions.deny == []
 
 
 GEO = """

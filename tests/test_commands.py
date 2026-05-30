@@ -16,9 +16,15 @@ from claude_dingtalk_bridge.commands import CommandType, parse_command
         ("ok", CommandType.APPROVE),
         ("YES", CommandType.APPROVE),
         ("Approve", CommandType.APPROVE),
+        ("\U0001f44c", CommandType.APPROVE),  # 👌
+        ("\U0001f44c\U0001f3fb", CommandType.APPROVE),  # 👌🏻 light skin
+        ("\U0001f44c\U0001f3ff", CommandType.APPROVE),  # 👌🏿 dark skin
+        ("  \U0001f44c\uFE0F  ", CommandType.APPROVE),  # padded 👌 + VS16
         ("no", CommandType.DENY),
         ("deny", CommandType.DENY),
         ("reject", CommandType.DENY),
+        ("❌", CommandType.DENY),  # ❌
+        ("  \u274c\uFE0F  ", CommandType.DENY),  # padded ❌ + VS16
     ],
 )
 def test_keyword_commands(text, expected):
@@ -82,6 +88,18 @@ def test_chinese_keywords_no_longer_recognized():
         assert parse_command(text).type == CommandType.PROMPT
 
 
+def test_unmapped_emoji_is_prompt():
+    # Only 👌/❌ are reply aliases; other emoji stay prompts.
+    for text in ("\U0001f44d", "\U0001f44e", "✅"):  # 👍 👎 ✅
+        assert parse_command(text).type == CommandType.PROMPT
+
+
+def test_reply_emoji_inside_text_is_prompt():
+    # The alias only fires on a bare emoji, not one embedded in a sentence.
+    cmd = parse_command("\U0001f44c looks good")  # 👌 looks good
+    assert cmd.type == CommandType.PROMPT
+
+
 def test_session_command():
     assert parse_command("/session").type == CommandType.SESSION
 
@@ -131,7 +149,6 @@ def test_model_command_parses(text, arg):
 
 
 def test_model_choices_names():
-    from claude_dingtalk_bridge.claude_runner import MODEL_CHOICES
+    from claude_dingtalk_bridge.orchestrator import MODEL_NAMES
 
-    names = [name for name, _ in MODEL_CHOICES]
-    assert names == ["default", "opus", "sonnet", "haiku"]
+    assert MODEL_NAMES == ("opus", "sonnet", "haiku")

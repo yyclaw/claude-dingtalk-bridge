@@ -8,7 +8,6 @@ from typing import Awaitable, Callable
 
 from claude_dingtalk_bridge.claude_runner import (
     aggregate_model_usage,
-    MODEL_CHOICES,
     ResultEvent,
     TaskEvent,
     TextEvent,
@@ -21,8 +20,8 @@ from claude_dingtalk_bridge.claude_runner import (
 from claude_dingtalk_bridge.commands import CommandType, parse_command
 from claude_dingtalk_bridge.config import Config
 from claude_dingtalk_bridge.geo import GeoCheck
+from claude_dingtalk_bridge.permission_hooks import tripwire_match
 from claude_dingtalk_bridge import log_context
-from claude_dingtalk_bridge.permissions import Decision, PermissionPolicy
 from claude_dingtalk_bridge.projects import ProjectRegistry
 from claude_dingtalk_bridge.questions import (
     format_question,
@@ -31,6 +30,7 @@ from claude_dingtalk_bridge.questions import (
     question_preview,
 )
 from claude_dingtalk_bridge.display import (
+    collapse_inline_paths,
     display_path,
     format_cost,
     format_tokens,
@@ -56,6 +56,12 @@ _RESUME_LIST_LIMIT = 7
 # Restarted whenever pending changes; rechecked after sleep so a notification
 # that arrives while the timer is about to fire still suppresses the message.
 _PENDING_NOTICE_DELAY = 30.0
+
+# Curated model aliases for the /model command. Mirrors the aliases the
+# Claude CLI accepts for --model; only aliases (no version numbers) so it
+# needn't change as models are bumped. A full model id can still be passed
+# directly via `/model <id>` — this list is just the shortcut menu.
+MODEL_NAMES: tuple[str, ...] = ("opus", "sonnet", "haiku")
 
 
 def _looks_like_narration(text: str) -> bool:
@@ -153,7 +159,6 @@ class Orchestrator:
         self,
         config: Config,
         registry: ProjectRegistry,
-        policy: PermissionPolicy,
         runner,
         send: Send,
         send_markdown: Send,
@@ -161,12 +166,12 @@ class Orchestrator:
     ):
         self._config = config
         self._registry = registry
-        self._policy = policy
         self._runner = runner
         self._send = send
-        # Command replies and Claude-authored text are rendered as markdown.
-        # Runtime task/permission messages keep send — their line-by-line
-        # layout would collapse under DingTalk's markdown newline folding.
+        # Command replies, Claude-authored text, and the permission prompt
+        # are rendered as markdown. Runtime task/progress messages keep send
+        # — their line-by-line layout would collapse under DingTalk's
+        # markdown newline folding.
         self._send_markdown = send_markdown
         self._verbose = False
         self._current_project = registry.default()
@@ -200,12 +205,12 @@ class Orchestrator:
         return sender_id == self._config.authorized_user_id
 
     async def notify(self, message: str) -> None:
-        """Push an out-of-band markdown notice to the phone.
+        """Push an out-of-band plain-text notice to the phone.
 
         For daemon-level paths (image download failures, shutdown notices)
         that need to reach the user without going through a Claude turn.
         """
-        await self._send_markdown(message)
+        await self._send(message)
 
     async def shutdown(self) -> None:
         """Best-effort graceful teardown: resolve pending waits, cancel work.
@@ -272,6 +277,8 @@ class Orchestrator:
             await self._cmd_resume(cmd.arg)
         elif cmd.type is CommandType.MODEL:
             await self._cmd_model(cmd.arg)
+        elif cmd.type is CommandType.MODE:
+            await self._cmd_mode(cmd.arg)
         elif cmd.type is CommandType.UNKNOWN:
             await self._cmd_unknown(cmd.arg or "")
         else:  # PROMPT
@@ -290,12 +297,12 @@ class Orchestrator:
             return
         text = (recognition or "").strip()
         if not text:
-            await self._send_markdown(
-                "🎤 Couldn't transcribe that voice message.  \n"
+            await self._send(
+                "🎤 Couldn't transcribe that voice message.\n"
                 "Please resend it, or type your message instead."
             )
             return
-        await self._send_markdown(f"🎤 Heard: {md_escape(text)}")
+        await self._send(f"🎤 Heard: {text}")
         await self._cmd_prompt(text)
 
     async def handle_image(self, prompt: str, sender_id: str) -> None:
@@ -328,7 +335,7 @@ class Orchestrator:
     async def _cmd_stop(self) -> None:
         if self._permission_future is not None and not self._permission_future.done():
             self._permission_future.set_result(False)
-            await self._send_markdown("🚫 Denied the pending operation.")
+            await self._send("🚫 Denied the pending operation.")
         if self._question_future is not None and not self._question_future.done():
             self._question_future.set_result(None)
         task = self._task
@@ -350,19 +357,19 @@ class Orchestrator:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             if self._task is None:
-                await self._send_markdown(
-                    "✅ Task stopped.  \n"
-                    "- The session is kept — send a new prompt anytime.\n"
-                    "- Or say `go on` to continue where it left off."
+                await self._send(
+                    "✅ Task stopped.\n"
+                    "The session is kept — send a new prompt anytime.\n"
+                    'Or say "go on" to continue where it left off.'
                 )
         else:
-            await self._send_markdown("ℹ️ No task is running.")
+            await self._send("ℹ️ No task is running.")
 
     async def _cmd_permission_reply(self, approved: bool) -> None:
         if self._permission_future is not None and not self._permission_future.done():
             self._permission_future.set_result(approved)
         else:
-            await self._send_markdown("ℹ️ No pending operation to confirm.")
+            await self._send("ℹ️ No pending operation to confirm.")
 
     async def _toggle(
         self,
@@ -376,22 +383,22 @@ class Orchestrator:
         val = (arg or "").lower()
         if val == "on":
             setattr(self, attr, True)
-            await self._send_markdown(on_msg)
+            await self._send(on_msg)
         elif val == "off":
             setattr(self, attr, False)
-            await self._send_markdown(off_msg)
+            await self._send(off_msg)
         else:
             state = "on" if getattr(self, attr) else "off"
-            await self._send_markdown(
-                f"ℹ️ {label} is **{state}**.  \nUsage: `{usage}`"
+            await self._send(
+                f"{label} is {state}. \nUsage: {usage}"
             )
 
     async def _cmd_set_verbose(self, arg: str | None) -> None:
         await self._toggle(
             arg,
             "_verbose",
-            on_msg="✅ **Verbose mode on** — showing tool calls and progress.",
-            off_msg="✅ **Verbose mode off** — replies only, tool calls hidden.",
+            on_msg="✅ Verbose mode on — showing tool calls and progress.",
+            off_msg="✅ Verbose mode off — replies only, tool calls hidden.",
             usage="/verbose on|off",
             label="Verbose mode",
         )
@@ -400,8 +407,8 @@ class Orchestrator:
         await self._toggle(
             arg,
             "_dry_run",
-            on_msg="🐛 **Debug mode on** — skipping Claude, echoing messages only.",
-            off_msg="✅ **Debug mode off**.",
+            on_msg="🐛 Debug mode on — skipping Claude, echoing messages only.",
+            off_msg="✅ Debug mode off.",
             usage="/debug on|off",
             label="Debug mode",
         )
@@ -419,34 +426,33 @@ class Orchestrator:
 
     async def _cmd_pwd(self) -> None:
         project = self._current_project
-        await self._send_markdown(
-            f"📂 **{md_escape(project.name)}**  \n"
-            f"{md_escape(display_path(project.path))}"
+        await self._send(
+            f"📂 {md_escape(display_path(project.path))}"
         )
 
     async def _cmd_switch_project(self, name: str | None) -> None:
         if not name:
-            await self._send_markdown(
-                "ℹ️ Usage: `/cd <project>`. Send `/ls` to list projects."
+            await self._send(
+                'ℹ️ Usage: `/cd <project>` \nSend `/ls` to list projects.'
             )
             return
         project = self._registry.get(name)
         if project is None:
-            await self._send_markdown(
-                f'⚠️ Project "{md_escape(name)}" not found. '
-                "Send `/ls` to list projects."
+            await self._send(
+                f'⚠️ Project "{md_escape(name)}" not found.\n'
+                'Send `/ls` to list projects.'
             )
             return
         if self._task is not None and not self._task.done():
-            await self._send_markdown(
-                "⚠️ A task is running. Send `/stop` first, then switch."
+            await self._send(
+                '⚠️ A task is running. Send `/stop` first, then switch.'
             )
             return
         self._current_project = project
         self._runner.reset(project.path)
         self._resume_candidates = []
-        await self._send_markdown(
-            f"📂 Switched to **{md_escape(project.name)}** — session reset."
+        await self._send(
+            f'📂 Switched to "{md_escape(project.name)}" — session reset.'
         )
 
     async def _cmd_status(self) -> None:
@@ -461,7 +467,7 @@ class Orchestrator:
             f"- **State:** {state}",
             f"- **Project:** {md_escape(project.name)}",
             f"- **Output:** {'verbose' if self._verbose else 'brief'}",
-            f"- **Model:** {short_model_name(self._runner.model_override or self._runner.observed_model or 'default')}",
+            f"- **Model:** {short_model_name(self._runner.model_override or self._runner.observed_model or 'SDK default')}",
         ]
         if self._dry_run:
             lines.append("- **Debug:** on")
@@ -530,45 +536,41 @@ class Orchestrator:
         await self._abort_running_task()
         self._queue.clear()
         self._runner.reset(self._current_project.path)
-        await self._send_markdown(
-            "🧹 Interrupted the current task and reset the session.  \n"
-            "The next message starts a fresh conversation."
+        await self._send(
+            "🧹 Interrupted the current task and reset the session.\n"
+            "💬 The next message starts a fresh conversation."
         )
 
     async def _cmd_help(self) -> None:
         await self._send_markdown(
             "🛠 **Commands**\n\n"
             "**Task**\n\n"
-            "- `/stop` — interrupt the current task\n"
-            "- `/clear` — interrupt & reset the session\n\n"
+            "- `/stop` — Interrupt current task\n"
+            "- `/clear` — Interrupt & reset current session\n\n"
             "**Project**\n\n"
-            "- `/pwd` — show the current project\n"
-            "- `/ls` — list projects\n"
-            "- `/cd <name>` — switch project\n\n"
+            "- `/pwd` — Show current working directory\n"
+            "- `/ls` — List projects\n"
+            "- `/cd <name>` — Switch working directory\n\n"
             "**Session**\n\n"
-            "- `/session` — show the current session id\n"
-            "- `/resume` — list recent sessions\n"
-            "- `/resume <n>` — switch to a listed session\n"
-            "- `/compact` — compact the conversation history\n\n"
+            "- `/session` — Show current session id\n"
+            "- `/resume [id]` — List or switch session\n"
+            "- `/compact` — Compact current conversation history\n\n"
             "**Info**\n\n"
-            "- `/help` — show this help\n"
-            "- `/status` — show runtime status\n"
-            "- `/context` — show context window usage\n"
-            "- `/usage` — show usage and cost\n\n"
+            "- `/status` — Show runtime status and token usage\n"
+            "- `/context` — Show context window usage\n\n"
             "**Modes**\n\n"
-            "- `/model` — list models\n"
-            "- `/model <n | name>` — switch model\n"
-            "- `/verbose on|off` — stream every step\n"
-            "- `/debug on|off` — skip Claude, debug the daemon only\n\n"
-            "Reply `approve` / `reject` to a permission prompt."
+            "- `/model [name]` — List or switch model\n"
+            "- `/mode [name]` — List or switch permission mode\n"
+            "- `/verbose on|off` — Stream every step\n"
+            "- `/debug on|off` — Skip Claude Code, debug the daemon only"
         )
 
     async def _cmd_session(self) -> None:
         project = self._current_project
         session_id = self._runner.current_session(project.path)
         if not session_id:
-            await self._send_markdown(
-                "🧵 **No session yet** for this project.  \n"
+            await self._send(
+                "🧵 No session yet for this project.\n"
                 "Send a message to start one."
             )
             return
@@ -583,17 +585,13 @@ class Orchestrator:
 
     async def _cmd_resume(self, arg: str | None) -> None:
         if self._task is not None and not self._task.done():
-            await self._send_markdown(
-                "⚠️ A task is running. Send `/stop` first, then resume."
-            )
+            await self._send('⚠️ A task is running. Send `/stop` first, then resume.')
             return
         project = self._current_project
         if not arg:
             infos = await list_recent_sessions(project.path, _RESUME_LIST_LIMIT)
             if not infos:
-                await self._send_markdown(
-                    "📋 No past sessions for this project."
-                )
+                await self._send("📋 No past sessions for this project.")
                 return
             self._resume_candidates = [info.session_id for info in infos]
             current = self._runner.current_session(project.path)
@@ -604,10 +602,10 @@ class Orchestrator:
             return
         self._runner.set_session(project.path, session_id)
         self._resume_candidates = []
-        await self._send_markdown(
-            f"🧵 Resumed session `{session_id[:8]}` · "
-            f"{md_escape(project.name)}  \n"
-            "The next message continues this conversation.  \n"
+        await self._send(
+            f'🧵 Resumed session "{session_id[:8]}" · '
+            f"{md_escape(project.name)}\n"
+            "💬 The next message continues this conversation.\n"
             "⚠️ Close the TUI on your computer before driving from here."
         )
 
@@ -619,37 +617,33 @@ class Orchestrator:
         if is_uuid(arg):
             info = await find_session(project_path, arg)
             if info is None:
-                await self._send_markdown(
-                    f"⚠️ Session `{arg[:8]}` not found in this project."
+                await self._send(
+                    f'⚠️ Session "{arg[:8]}" not found in this project.'
                 )
                 return None
             return info.session_id
         if arg.isdigit():
             if not self._resume_candidates:
-                await self._send_markdown(
-                    "ℹ️ Send `/resume` first to see the list."
-                )
+                await self._send('ℹ️ Send `/resume` first to see the list.')
                 return None
             idx = int(arg)
             if idx < 1 or idx > len(self._resume_candidates):
-                await self._send_markdown(
-                    f"⚠️ Pick a number 1-{len(self._resume_candidates)}, "
-                    "or send `/resume` to refresh the list."
+                await self._send(
+                    f"⚠️ Pick a number 1-{len(self._resume_candidates)},"
+                    'or send `/resume` to refresh the list.'
                 )
                 return None
             return self._resume_candidates[idx - 1]
-        await self._send_markdown(
-            "ℹ️ Usage: `/resume`, `/resume <number>`, or `/resume <session-id>`."
-        )
+        await self._send('ℹ️ Usage: `/resume`, `/resume <number>`, or `/resume <session-id>`.')
         return None
 
     def _format_model_list(self) -> str:
         override = self._runner.model_override
-        known = {name for name, _ in MODEL_CHOICES}
+        known = set(MODEL_NAMES)
         lines = ["🤖 **Models**", ""]
-        for idx, (name, desc) in enumerate(MODEL_CHOICES, start=1):
+        for name in MODEL_NAMES:
             mark = " *(current)*" if override == name else ""
-            lines.append(f"- **{idx}. {name}**{mark} — {desc}")
+            lines.append(f"- {name} {mark}")
         lines.append("")
         # A list-external override (a full model id) gets its own line since
         # no list entry would be marked; otherwise show the observed default.
@@ -661,37 +655,54 @@ class Orchestrator:
             if observed:
                 lines.append(f"Current: `{observed}`")
             else:
-                lines.append(
-                    "Current: SDK default — send a message to detect it."
-                )
+                lines.append("Current: SDK default — send a prompt to detect it.")
         lines.append("")
-        lines.append("💬 `/model <n>` or `/model <name>` to switch")
+        lines.append('💬 `/model <name>` to switch')
+        lines.append("")
+        lines.append('🎏 Example: /model claude-opus-4-8[1m]')
         return "\n".join(lines)
 
     async def _cmd_model(self, arg: str | None) -> None:
         if not arg:
             await self._send_markdown(self._format_model_list())
             return
-        if arg.isdigit():
-            idx = int(arg)
-            if idx < 1 or idx > len(MODEL_CHOICES):
-                await self._send_markdown(
-                    f"⚠️ Pick a number 1-{len(MODEL_CHOICES)}, "
-                    "or send `/model` to see the list."
-                )
-                return
-            name = MODEL_CHOICES[idx - 1][0]
-        else:
-            name = arg
-        self._runner.set_model(name)
-        await self._send_markdown(
-            f"🤖 Model set to **{md_escape(name)}** — takes effect next turn."
+        self._runner.set_model(arg)
+        await self._send(
+            f'🤖 Model set to "{arg}" — takes effect next turn.'
         )
 
+    async def _cmd_mode(self, arg: str | None) -> None:
+        valid = ("acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan")
+        if not arg:
+            current = self._runner.permission_mode
+            lines = ["🛡 **Permission modes**"]
+            for name in valid:
+                mark = " (current)" if name == current else ""
+                lines.append(f"- `{name}`{mark}")
+            lines.append("- `reset` — fall back to TUI's settings")
+            lines.append("")
+            lines.append('💬 `/mode <name>` to switch')
+            await self._send_markdown("\n".join(lines))
+            return
+        if arg.lower() == "reset":
+            self._runner.set_permission_mode(None)
+            await self._send(
+                "🛡 Mode override cleared — next turn defaults to your TUI's settings."
+            )
+            return
+        if arg not in valid:
+            await self._send(
+                f"⚠️ Unknown mode `{arg}`. Pick one of: "
+                f"{', '.join(valid)}, or `reset`."
+            )
+            return
+        self._runner.set_permission_mode(arg)
+        await self._send(f'🛡 Mode set to "{arg}" — takes effect next turn.')
+
     async def _cmd_unknown(self, text: str) -> None:
-        await self._send_markdown(
-            f"❓ Unknown command: **{md_escape(text)}**  \n"
-            "Send `/help` for the command list."
+        await self._send(
+            f'❓ Unknown command: `{md_escape(text)}`\n'
+            'Send `/help` for the command list.'
         )
 
     async def _cmd_prompt(self, prompt: str) -> None:
@@ -812,7 +823,7 @@ class Orchestrator:
             # ResultMessage text only when the turn produced no text at all.
             if not self._turn_sent_text:
                 await self._send_markdown(
-                    event.text.strip() or "(no text output)"
+                    event.text.strip() or "(empty)"
                 )
             self._arm_pending_notice()
         elif isinstance(event, TodoEvent):
@@ -901,22 +912,21 @@ class Orchestrator:
         )
 
     async def request_permission(
-        self, tool_name: str, tool_input: dict, project_path: str
+        self, tool_name: str, tool_input: dict, project_path: str | None = None
     ) -> bool:
-        decision = self._policy.evaluate(tool_name, tool_input, project_path)
         summary = tool_summary(tool_name, tool_input)
         input_preview = _summary(summary) if summary else ""
-        if decision is Decision.ALLOW:
-            # Auto-allows are the common case — log at DEBUG to keep INFO clean
-            # while still allowing "why did this go through?" forensics.
-            logger.debug(
-                "permission auto-allow tool=%s input=%r", tool_name, input_preview
-            )
-            return True
         # Escalations are serialized: parallel tool calls each get their own
         # prompt-and-wait rather than clobbering a shared pending future.
         async with self._permission_lock:
-            desc = f"{tool_name} · {summary}" if summary else tool_name
+            # Wrap the summary in a fenced code block so a heredoc body with
+            # a `# …` Python/shell comment line doesn't get rendered as an H1.
+            body = f"{tool_name}:\n```\n{summary}\n```" if summary else tool_name
+            # A tripwire-matched Bash command (rm -f, dd of=/dev/*, …) gets a
+            # louder icon than the routine lock so it's unmistakable on the phone.
+            icon = "🔐"
+            if tool_name == "Bash" and tripwire_match(tool_input.get("command") or ""):
+                icon = "‼️"
             loop = asyncio.get_running_loop()
             self._permission_future = loop.create_future()
             chip = f"{tool_name}#{secrets.token_hex(4)}"
@@ -924,8 +934,8 @@ class Orchestrator:
                 'permission escalate tool=%s input="%s" → phone',
                 chip, input_preview,
             )
-            await self._send(
-                f"🔐 **Permission needed**\n{desc}\n\nReply `ok` to allow, `no` to deny."
+            await self._send_markdown(
+                f'### {icon} Permission needed\n\n{body}\n\nReply `ok` to allow, `no` to deny.'
             )
             start = loop.time()
             try:

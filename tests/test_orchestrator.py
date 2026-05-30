@@ -8,7 +8,6 @@ import claude_dingtalk_bridge.orchestrator as orch_mod
 from claude_dingtalk_bridge.claude_runner import ResultEvent, TextEvent, ToolEvent
 from claude_dingtalk_bridge.config import Config, PermissionRules, Project
 from claude_dingtalk_bridge.orchestrator import Orchestrator
-from claude_dingtalk_bridge.permissions import PermissionPolicy
 from claude_dingtalk_bridge.projects import ProjectRegistry
 
 AUTHORIZED = "staff-1"
@@ -39,10 +38,7 @@ def make_config() -> Config:
             Project(name="multica", path="/tmp/multica"),
             Project(name="docs", path="/tmp/docs"),
         ],
-        permissions=PermissionRules(
-            allowed_tools=["Read"], allowed_bash=["git status"],
-            allow_edits_in_project=True,
-        ),
+        permissions=PermissionRules(deny=[]),
         permission_timeout_seconds=600,
     )
 
@@ -66,6 +62,7 @@ class FakeRunner:
         self.last_turn_costs: dict[str, float | None] = {}
         self.model_override = None
         self.observed_model = None
+        self.permission_mode = None
         self.is_draining = False
         self.drain_cancels = 0
         self.turn_counts: dict[str, int] = {}
@@ -76,6 +73,9 @@ class FakeRunner:
 
     def set_model(self, model):
         self.model_override = model
+
+    def set_permission_mode(self, mode):
+        self.permission_mode = mode
 
     def reset(self, project_path: str) -> None:
         self.resets.append(project_path)
@@ -134,7 +134,6 @@ def build(runner=None, geo_check=None):
     orchestrator = Orchestrator(
         config=config,
         registry=ProjectRegistry(config.projects),
-        policy=PermissionPolicy(config.permissions),
         runner=runner,
         send=send,
         send_markdown=send,
@@ -161,7 +160,6 @@ def build_channels(runner=None):
     orchestrator = Orchestrator(
         config=config,
         registry=ProjectRegistry(config.projects),
-        policy=PermissionPolicy(config.permissions),
         runner=runner,
         send=send,
         send_markdown=send_markdown,
@@ -252,7 +250,7 @@ async def test_prompt_runs_a_turn():
     assert runner.turns == [("/tmp/multica", "fix the login bug")]
     assert any("Task started" in m for m in sent)
     # The turn's reply is sent on its own — no "Done"-style header.
-    assert any("(no text output)" in m for m in sent)
+    assert any("(empty)" in m for m in sent)
     assert not any("Done" in m for m in sent)
 
 
@@ -305,15 +303,6 @@ async def test_stop_with_no_task():
     assert any("No task" in m for m in sent)
 
 
-async def test_permission_allow_does_not_escalate():
-    orchestrator, runner, sent = build()
-    approved = await orchestrator.request_permission(
-        "Read", {"file_path": "/tmp/multica/a.py"}, "/tmp/multica"
-    )
-    assert approved is True
-    assert not any("Permission needed" in m for m in sent)
-
-
 async def test_permission_escalates_and_resolves_on_approve():
     orchestrator, runner, sent = build()
 
@@ -322,7 +311,7 @@ async def test_permission_escalates_and_resolves_on_approve():
         await orchestrator.handle_message("ok", AUTHORIZED)
 
     result, _ = await asyncio.gather(
-        orchestrator.request_permission("Bash", {"command": "rm x"}, "/tmp/multica"),
+        orchestrator.request_permission("Bash", {"command": "rm x"}),
         approve_soon(),
     )
     assert result is True
@@ -337,7 +326,7 @@ async def test_permission_escalates_and_resolves_on_deny():
         await orchestrator.handle_message("no", AUTHORIZED)
 
     result, _ = await asyncio.gather(
-        orchestrator.request_permission("Bash", {"command": "rm x"}, "/tmp/multica"),
+        orchestrator.request_permission("Bash", {"command": "rm x"}),
         deny_soon(),
     )
     assert result is False
@@ -346,11 +335,82 @@ async def test_permission_escalates_and_resolves_on_deny():
 async def test_permission_timeout_denies():
     orchestrator, runner, sent = build()
     orchestrator._config.permission_timeout_seconds = 0
-    result = await orchestrator.request_permission(
-        "Bash", {"command": "rm x"}, "/tmp/multica"
-    )
+    result = await orchestrator.request_permission("Bash", {"command": "rm x"})
     assert result is False
     assert any("timed out" in m for m in sent)
+
+
+async def test_permission_prompt_wraps_command_in_code_fence():
+    """A heredoc with a leading `# …` comment line must not render as an H1.
+
+    Regression: the prompt used to interpolate the raw command directly into
+    the markdown body, so a Python/shell comment line at column 0 was parsed
+    by DingTalk's markdown renderer as a level-1 heading and shown at giant
+    font size.
+    """
+    orchestrator, _, _, md_sent = build_channels()
+    command = (
+        "cat > /tmp/x.py << 'EOF'\n"
+        "import re\n"
+        "\n"
+        "# Read orchestrator.py and extract _send calls\n"
+        "EOF"
+    )
+
+    async def approve_soon():
+        while orchestrator._permission_future is None or orchestrator._permission_future.done():
+            await asyncio.sleep(0)
+        await orchestrator.handle_message("ok", AUTHORIZED)
+
+    await asyncio.gather(
+        orchestrator.request_permission("Bash", {"command": command}),
+        approve_soon(),
+    )
+    prompt = next(m for m in md_sent if "Permission needed" in m)
+    assert f"```\n{command}\n```" in prompt
+    # No bare `# ` line outside the fence (would render as H1).
+    fence_open = prompt.index("```")
+    fence_close = prompt.index("```", fence_open + 3)
+    outside = prompt[:fence_open] + prompt[fence_close + 3:]
+    assert not any(
+        line.lstrip().startswith("# ") and not line.lstrip().startswith("###")
+        for line in outside.splitlines()
+    )
+
+
+async def test_permission_prompt_flags_dangerous_bash_command():
+    """A tripwire-matched Bash command swaps the lock for a louder ‼️."""
+    orchestrator, _, _, md_sent = build_channels()
+
+    async def approve_soon():
+        while orchestrator._permission_future is None or orchestrator._permission_future.done():
+            await asyncio.sleep(0)
+        await orchestrator.handle_message("ok", AUTHORIZED)
+
+    await asyncio.gather(
+        orchestrator.request_permission("Bash", {"command": "rm -rf /tmp/x"}),
+        approve_soon(),
+    )
+    prompt = next(m for m in md_sent if "Permission needed" in m)
+    assert "‼️" in prompt
+    assert "🔐" not in prompt
+
+
+async def test_permission_prompt_keeps_lock_for_ordinary_command():
+    orchestrator, _, _, md_sent = build_channels()
+
+    async def approve_soon():
+        while orchestrator._permission_future is None or orchestrator._permission_future.done():
+            await asyncio.sleep(0)
+        await orchestrator.handle_message("ok", AUTHORIZED)
+
+    await asyncio.gather(
+        orchestrator.request_permission("Bash", {"command": "git push"}),
+        approve_soon(),
+    )
+    prompt = next(m for m in md_sent if "Permission needed" in m)
+    assert "🔐" in prompt
+    assert "‼️" not in prompt
 
 
 async def test_concurrent_escalations_are_serialized():
@@ -365,8 +425,8 @@ async def test_concurrent_escalations_are_serialized():
             await asyncio.sleep(0)
 
     r1, r2, _ = await asyncio.gather(
-        orchestrator.request_permission("Bash", {"command": "rm a"}, "/tmp/multica"),
-        orchestrator.request_permission("Bash", {"command": "rm b"}, "/tmp/multica"),
+        orchestrator.request_permission("Bash", {"command": "rm a"}),
+        orchestrator.request_permission("Bash", {"command": "rm b"}),
         approve_twice(),
     )
     assert r1 is True and r2 is True
@@ -722,7 +782,7 @@ async def test_resume_number_zero_rejected():
 async def test_resume_number_without_listing():
     orchestrator, runner, sent = build()
     await orchestrator.handle_message("/resume 1", AUTHORIZED)
-    assert any("`/resume` first" in m for m in sent)
+    assert any('`/resume` first' in m for m in sent)
 
 
 async def test_resume_by_uuid(monkeypatch):
@@ -999,23 +1059,10 @@ async def test_model_no_arg_lists_models():
     assert "sonnet" in msg
 
 
-async def test_model_switch_by_number():
-    orchestrator, runner, sent = build()
-    await orchestrator.handle_message("/model 3", AUTHORIZED)
-    assert runner.model_override == "sonnet"
-
-
 async def test_model_switch_by_name():
     orchestrator, runner, sent = build()
     await orchestrator.handle_message("/model opus", AUTHORIZED)
     assert runner.model_override == "opus"
-
-
-async def test_model_number_out_of_range():
-    orchestrator, runner, sent = build()
-    await orchestrator.handle_message("/model 9", AUTHORIZED)
-    assert runner.model_override is None
-    assert any("1-4" in m for m in sent)
 
 
 async def test_model_list_marks_current():
@@ -1023,6 +1070,57 @@ async def test_model_list_marks_current():
     runner.model_override = "sonnet"
     await orchestrator.handle_message("/model", AUTHORIZED)
     assert any("(current)" in m for m in sent)
+
+
+async def test_mode_no_arg_lists_all_modes():
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/mode", AUTHORIZED)
+    msg = "\n".join(sent)
+    for name in ("default", "acceptEdits", "bypassPermissions", "plan", "reset"):
+        assert name in msg, f"{name} missing from /mode listing"
+
+
+async def test_mode_no_arg_marks_current_when_set():
+    orchestrator, runner, sent = build()
+    runner.permission_mode = "acceptEdits"
+    await orchestrator.handle_message("/mode", AUTHORIZED)
+    msg = "\n".join(sent)
+    # The current row carries the marker; the others don't.
+    assert "acceptEdits` (current)" in msg
+    assert "plan` (current)" not in msg
+
+
+async def test_mode_no_arg_omits_current_on_reset_when_unset():
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/mode", AUTHORIZED)
+    msg = "\n".join(sent)
+    assert "reset" in msg
+    assert "(current)" not in msg
+
+
+@pytest.mark.parametrize(
+    "mode", ["default", "acceptEdits", "bypassPermissions", "plan"]
+)
+async def test_mode_set_valid(mode):
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message(f"/mode {mode}", AUTHORIZED)
+    assert runner.permission_mode == mode
+    assert any(mode in m for m in sent)
+
+
+async def test_mode_reset_clears_override():
+    orchestrator, runner, sent = build()
+    runner.permission_mode = "plan"
+    await orchestrator.handle_message("/mode reset", AUTHORIZED)
+    assert runner.permission_mode is None
+    assert any("cleared" in m for m in sent)
+
+
+async def test_mode_unknown_value_rejected():
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/mode wild", AUTHORIZED)
+    assert runner.permission_mode is None
+    assert any("Unknown mode" in m for m in sent)
 
 
 async def test_status_shows_model():
@@ -1035,7 +1133,7 @@ async def test_status_shows_model():
 async def test_status_shows_default_model_when_unset():
     orchestrator, runner, sent = build()
     await orchestrator.handle_message("/status", AUTHORIZED)
-    assert any("**Model:** default" in m for m in sent)
+    assert any("**Model:** SDK default" in m for m in sent)
 
 
 async def test_help_lists_new_commands():
@@ -1644,16 +1742,13 @@ async def test_running_turn_log_truncates_long_prompt(caplog):
 
 
 async def test_request_permission_logs_escalation_to_phone(caplog):
-    # Auto-allow is DEBUG (common case, no need to flood INFO); escalations
-    # and the eventual phone reply are INFO so an operator can trace what
-    # was asked and how long it took.
+    # Escalation and reply log at INFO so an operator can trace what was
+    # asked and how long it took.
     import logging
     orchestrator, _runner, sent = build()
     with caplog.at_level(logging.INFO, logger="claude_dingtalk_bridge.orchestrator"):
         task = asyncio.create_task(
-            orchestrator.request_permission(
-                "Bash", {"command": "rm -rf /tmp/x"}, "/tmp/multica",
-            )
+            orchestrator.request_permission("Bash", {"command": "rm -rf /tmp/x"})
         )
         # Yield enough for the escalation message to be emitted before we reply.
         for _ in range(20):
@@ -1677,9 +1772,7 @@ async def test_request_permission_logs_denial(caplog):
     orchestrator, _runner, _sent = build()
     with caplog.at_level(logging.INFO, logger="claude_dingtalk_bridge.orchestrator"):
         task = asyncio.create_task(
-            orchestrator.request_permission(
-                "Bash", {"command": "rm -rf /tmp/x"}, "/tmp/multica",
-            )
+            orchestrator.request_permission("Bash", {"command": "rm -rf /tmp/x"})
         )
         for _ in range(20):
             await asyncio.sleep(0)
@@ -1701,28 +1794,11 @@ async def test_request_permission_logs_timeout(caplog, monkeypatch):
     monkeypatch.setattr(orchestrator._config, "permission_timeout_seconds", 0.05)
     with caplog.at_level(logging.INFO, logger="claude_dingtalk_bridge.orchestrator"):
         result = await orchestrator.request_permission(
-            "Bash", {"command": "rm -rf /tmp/x"}, "/tmp/multica",
+            "Bash", {"command": "rm -rf /tmp/x"}
         )
     assert result is False
     lines = [r.getMessage() for r in caplog.records]
     assert any("permission timeout" in l for l in lines)
-
-
-async def test_request_permission_auto_allow_at_debug_only(caplog):
-    import logging
-    orchestrator, _runner, _sent = build()
-    # `git status` is on the allowed_bash list — should auto-allow silently.
-    with caplog.at_level(logging.DEBUG, logger="claude_dingtalk_bridge.orchestrator"):
-        result = await orchestrator.request_permission(
-            "Bash", {"command": "git status"}, "/tmp/multica",
-        )
-    assert result is True
-    # No INFO escalation/reply lines for the auto-allow path.
-    info_lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-    assert not any("permission" in l for l in info_lines)
-    # The decision is still traceable at DEBUG.
-    debug_lines = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
-    assert any("permission auto-allow" in l and "tool=Bash" in l for l in debug_lines)
 
 
 async def test_answer_question_logs_round_trip(caplog):
@@ -1758,10 +1834,11 @@ async def test_answer_question_logs_empty_questions(caplog):
 # --- shutdown / notify -------------------------------------------------
 
 
-async def test_notify_pushes_markdown_through_send_markdown_channel():
-    orchestrator, _runner, _text, md_sent = build_channels()
+async def test_notify_pushes_through_plain_text_channel():
+    orchestrator, _runner, text_sent, md_sent = build_channels()
     await orchestrator.notify("📷 image failed")
-    assert md_sent == ["📷 image failed"]
+    assert text_sent == ["📷 image failed"]
+    assert md_sent == []
 
 
 async def test_shutdown_resolves_pending_permission_future():

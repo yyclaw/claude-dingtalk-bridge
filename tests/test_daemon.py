@@ -21,9 +21,7 @@ def make_config() -> Config:
         dingtalk_client_secret="s",
         authorized_user_id="staff-1",
         projects=[Project(name="p", path="/tmp/p")],
-        permissions=PermissionRules(
-            allowed_tools=["Read"], allowed_bash=[], allow_edits_in_project=True
-        ),
+        permissions=PermissionRules(deny=[]),
     )
 
 
@@ -65,8 +63,22 @@ async def test_build_orchestrator_markdown_sender_uses_markdown_template(monkeyp
     monkeypatch.setattr(
         transport, "send_text", lambda uid, text: calls.append(("text", uid, text)),
     )
-    await orchestrator._send_markdown("# hi")
-    assert calls == [("md", "staff-1", "Claude", "# hi")]
+    await orchestrator._send_markdown("plain body without a heading")
+    assert calls == [
+        ("md", "staff-1", "Claude has replied.", "plain body without a heading")
+    ]
+
+
+async def test_build_orchestrator_markdown_sender_lifts_heading_as_title(monkeypatch):
+    orchestrator, transport = build_orchestrator(make_config())
+    calls: list = []
+    monkeypatch.setattr(
+        transport, "send_markdown",
+        lambda uid, title, text: calls.append((uid, title, text)),
+    )
+    body = "### 🔐 Permission needed\n\nBash · ls"
+    await orchestrator._send_markdown(body)
+    assert calls == [("staff-1", "🔐 Permission needed", body)]
 
 
 class _FakeCallback:
@@ -1014,3 +1026,42 @@ async def test_serve_stream_once_propagates_cancel(monkeypatch):
     # Keepalive was started and must have been cancelled in the finally block.
     assert client.keepalive_started
     assert client.keepalive_cancelled
+
+
+def test_build_orchestrator_wires_permission_rules_onto_runner():
+    """Runner must receive the parsed permission rules and a settings file path so
+    _build_options can write the flag-layer JSON on the very first turn."""
+    from pathlib import Path
+
+    from claude_dingtalk_bridge.daemon import build_orchestrator
+    from claude_dingtalk_bridge.config import Config, PermissionRules, Project
+
+    config = Config(
+        dingtalk_client_id="cid",
+        dingtalk_client_secret="csec",
+        authorized_user_id="uid",
+        projects=[Project(name="p", path="/tmp")],
+        permissions=PermissionRules(deny=["Bash(rm -rf:*)"]),
+    )
+    orch, _transport = build_orchestrator(config)
+    runner = orch._runner
+    assert runner.permission_rules is config.permissions
+    assert isinstance(runner.settings_file_path, Path)
+    assert runner.settings_file_path.name == "permissions.json"
+
+
+def test_extract_title_skips_leading_blank_lines():
+    # Leading blank lines must be skipped so the first *content* line decides
+    # whether the body opens with a heading.
+    from claude_dingtalk_bridge.daemon import _extract_title
+
+    assert _extract_title("\n\n### Heads up\nbody") == "Heads up"
+
+
+def test_extract_title_returns_none_when_no_leading_heading():
+    # Only a leading heading counts; a body that opens with prose has no title.
+    from claude_dingtalk_bridge.daemon import _extract_title
+
+    assert _extract_title("hello world\n### too late") is None
+    assert _extract_title("") is None
+    assert _extract_title("\n\n") is None

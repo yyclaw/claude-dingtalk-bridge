@@ -40,7 +40,7 @@ def format_session_list(infos, current_id: str | None) -> str:
         if len(summary) > _SUMMARY_LIMIT:
             summary = summary[:_SUMMARY_LIMIT] + "…"
         summary = md_escape(summary)
-        meta = [format_relative_time(info.last_modified)]
+        meta = ["　" + format_relative_time(info.last_modified)]
         if info.git_branch:
             meta.append(md_escape(info.git_branch))
         meta.append(format_size(info.file_size))

@@ -1,78 +1,53 @@
+"""Permission helpers wiring config.yaml rules into the Claude Agent SDK.
+
+The bridge's config only carries a ``deny`` list. The flag-layer settings JSON
+also auto-expands edit-shaped tools to the current project root so the phone
+isn't asked for every in-project edit. The file is passed to the SDK via
+``ClaudeAgentOptions(settings=...)`` at the highest user-controlled precedence,
+so the deny list here overrides allow rules in lower settings layers
+(``~/.claude/settings.json``, project ``.claude/settings.json``).
+
+The Bash deny check lives in :mod:`.permission_hooks` as a PreToolUse hook so
+it intercepts *before* any settings-layer allow short-circuit can fire.
+"""
 from __future__ import annotations
 
-from enum import Enum, auto
+import json
 from pathlib import Path
+from typing import Any
 
 from claude_dingtalk_bridge.config import PermissionRules
 
-
-class Decision(Enum):
-    ALLOW = auto()
-    ESCALATE = auto()
+_EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 
 
-_EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-# Any one of these in the command escalates: shell would interpret it as
-# redirection, glob expansion, brace expansion, command substitution or
-# command chaining. Substring match is intentional — even inside quotes
-# these turn a "prefix + args" allowlist into arbitrary code. Glob chars
-# (`*` `?` `{`) are listed because `rm *` under an `rm` prefix would
-# auto-delete the cwd.
-_SHELL_METACHARS = (
-    "&&", "||", "&", ";", "|", ">", "<", "`", "$(", "${",
-    "\n", "\r", "*", "?", "{",
-)
+def build_permission_settings(rules: PermissionRules, cwd: str) -> dict[str, Any]:
+    """Build the flag-layer settings dict for the SDK to load.
+
+    The shape matches ``~/.claude/settings.json``. Each edit-shaped tool is
+    scoped to ``cwd`` via a ``Tool(<cwd>/**)`` allow pattern so in-project
+    edits don't escalate to the phone.
+    """
+    allow = [f"{tool}({cwd}/**)" for tool in _EDIT_TOOLS]
+    return {
+        "permissions": {
+            "allow": allow,
+            "deny": list(rules.deny),
+        }
+    }
 
 
-class PermissionPolicy:
-    def __init__(self, rules: PermissionRules):
-        self._rules = rules
-        # Single-slot cache; project_path is stable within a project and only
-        # changes on /cd, so caching avoids a redundant resolve() per edit.
-        self._project_cache: tuple[str, Path] | None = None
+def write_permission_settings_file(
+    rules: PermissionRules, cwd: str, path: Path
+) -> Path:
+    """Write the settings dict to ``path`` atomically; return the path.
 
-    def evaluate(self, tool_name: str, tool_input: dict, project_path: str) -> Decision:
-        if tool_name in self._rules.allowed_tools:
-            return Decision.ALLOW
-        if tool_name in _EDIT_TOOLS:
-            return self._evaluate_edit(tool_input, project_path)
-        if tool_name == "Bash":
-            return self._evaluate_bash(tool_input)
-        return Decision.ESCALATE
-
-    def _resolve_project(self, project_path: str) -> Path | None:
-        cache = self._project_cache
-        if cache is not None and cache[0] == project_path:
-            return cache[1]
-        try:
-            resolved = Path(project_path).expanduser().resolve()
-        except (OSError, RuntimeError):
-            return None
-        self._project_cache = (project_path, resolved)
-        return resolved
-
-    def _evaluate_edit(self, tool_input: dict, project_path: str) -> Decision:
-        if not self._rules.allow_edits_in_project:
-            return Decision.ESCALATE
-        target = tool_input.get("file_path") or tool_input.get("path")
-        if not target:
-            return Decision.ESCALATE
-        base = self._resolve_project(project_path)
-        if base is None:
-            return Decision.ESCALATE
-        try:
-            target_resolved = Path(target).expanduser().resolve()
-        except (OSError, RuntimeError):
-            return Decision.ESCALATE
-        return Decision.ALLOW if target_resolved.is_relative_to(base) else Decision.ESCALATE
-
-    def _evaluate_bash(self, tool_input: dict) -> Decision:
-        command = (tool_input.get("command") or "").strip()
-        if not command:
-            return Decision.ESCALATE
-        if any(meta in command for meta in _SHELL_METACHARS):
-            return Decision.ESCALATE
-        for prefix in self._rules.allowed_bash:
-            if command == prefix or command.startswith(prefix + " "):
-                return Decision.ALLOW
-        return Decision.ESCALATE
+    Atomic write avoids the SDK reading a half-written file if a turn racing
+    with another turn ever triggers a regenerate.
+    """
+    settings = build_permission_settings(rules, cwd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(settings, indent=2))
+    tmp.replace(path)
+    return path

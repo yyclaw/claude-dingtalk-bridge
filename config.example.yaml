@@ -1,46 +1,65 @@
-# Copy to ~/.config/claude-dingtalk-bridge/config.yaml and fill in.
+# Please take care to protect the security of your data and do not disclose it to others lightly.
 dingtalk:
-  client_id: "YOUR_APP_KEY"        # DingTalk Open Platform app Client ID (AppKey)
-  client_secret: "YOUR_APP_SECRET" # Client Secret (AppSecret)
+  client_id: "YOUR_APP_KEY"
+  client_secret: "YOUR_APP_SECRET"
 
 # Only messages from this DingTalk user are processed (your own staffId).
 authorized_user_id: "YOUR_STAFF_ID"
 
 # Allowed project directories (the first one is the default project).
+#
+# The bridge always appends {Edit,Write,MultiEdit,NotebookEdit}(<path>/**)
+# to the Claude Code's settings.json settings permissions.allow list each
+# turn (tracks /cd), so in-project edits don't escalate to the phone.
 projects:
   - name: hello-world
     path: ~/Projects/hello-world
 
-# Permission allowlist: a match is auto-approved, otherwise it escalates
-# to the phone for confirmation.
+# Permissions. Each tool call walks these gates in order; first decision wins.
 #
-# Footguns to keep in mind:
-#  - allowed_tools is an exact tool-name match checked FIRST. Listing Bash,
-#    Edit or Write here auto-approves *every* such call and bypasses the
-#    shell-metacharacter and project-directory checks below. Keep it to
-#    genuinely read-only tools.
-#  - allowed_bash prefixes match only the command's first word(s), so a
-#    broad prefix like "git" or "npm" auto-approves every subcommand
-#    (e.g. `npm install`, which runs arbitrary install scripts). Prefer
-#    specific, harmless prefixes such as "git status".
-#  - allowed_bash does NOT block shell tilde expansion: a prefix like "rm"
-#    would auto-approve `rm ~/important` because the shell expands `~` to
-#    $HOME at runtime. Keep destructive or shell-launching commands (`rm`,
-#    `mv`, `cp`, `dd`, `bash`, `sh`, `eval`) OUT of this list and let them
-#    escalate to the phone each time.
+#   tool call by Claude Code
+#       │
+#       ▼
+#   ┌─ (1) PreToolUse guards ─────────────────────────────────────────┐
+#   │ One-sided: both only escalate to a phone ask, never hard-deny.  │
+#   │ 1) Bash guard: always-on tripwires catch `rm -f`, `rm --force`, │
+#   │ `dd of=/dev/*`, `mkfs`, raw block-device writes, fork bombs;    │
+#   │ then bashlex splits into atoms and checks each against `deny`   │
+#   │ below (so a buried `cd /tmp && bash -c "rm -rf /foo"` is        │
+#   │ caught). A write into .git/.claude escalates (incl. cp/tee).    │
+#   │ 2) Edit guard: escalates an edit resolving outside the project  │
+#   │ root, or into the project's .git/.claude.                       │
+#   │ Anything else falls through.                                    │
+#   └─────────────────────────────────────────────────────────────────┘
+#       │ no decision
+#       ▼
+#   ┌─ (2) Settings layer ────────────────────────────────────────────┐
+#   │ Claude Code merges this file with its settings.json layers      │
+#   │ (user ~/.claude/, plus per-project .claude/). Deny here is      │
+#   │ written at the highest user-controlled precedence, so it        │
+#   │ overrides allow rules in lower layers. A deny resolved here     │
+#   │ is a hard block — the call is refused without a phone ask.      │
+#   └─────────────────────────────────────────────────────────────────┘
+#       │ no match
+#       ▼
+#   (3) Phone prompt via DingTalk — reply `ok` / `no`.
+#
+# Footgun:
+#  - The Bash command guard only escalates Bash; deny on a non-Bash tool is
+#    enforced solely by gate (2). Everything not pre-decided lands on the
+#    phone ask at gate (3).
+#  - Allow rules in your lower settings layers (~/.claude/, project .claude/)
+#    stay live: a matching call auto-runs at gate (2) with no phone ask. Only
+#    `deny` here or a gate (1) escalation overrides them.
 permissions:
-  allow_edits_in_project: true     # auto-approve file edits inside the current project
-  allowed_tools:                   # auto-approved tools (keep read-only — see note above)
-    - Read
-    - Glob
-    - Grep
-  allowed_bash:                    # auto-approved Bash command prefixes (exact, or prefix + space)
-    - "git status"
-    - "git diff"
-    - "git log"
-    - "ls"
-    - "cat"
-    # Add your project's test command, e.g.: "pnpm test", "go test", "pytest -q"
+  # Same syntax as Claude Code's settings.json permissions.deny. Empty is
+  # fine — the built-in tripwires still catch the obvious catastrophic forms.
+  deny:
+    - "Bash(rm -rf:*)"
+    - "Bash(rm -fr:*)"
+    - "Bash(rm -f:*)"
+    - "Bash(git push --force:*)"
+    - "Bash(git push -f:*)"
 
 # Timeout (seconds) for a permission request; denied automatically on timeout.
 permission_timeout_seconds: 600
@@ -48,6 +67,6 @@ permission_timeout_seconds: 600
 # Geo gate: omit the whole section to skip the check and the proxy.
 geo:
   proxy_url: http://127.0.0.1:8118      # local proxy address, shared by http/https
-  target_country: US                    # expected exit-IP countryCode
   geo_service: http://ip-api.com/json   # returns the caller's exit IP geolocation
   timeout_seconds: 3                    # geo service request timeout, in seconds
+  target_country: US                    # expected exit-IP countryCode
