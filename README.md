@@ -23,9 +23,9 @@ Remotely drive the Claude Code running on your computer from your phone over Din
 make setup
 
 # 3. Create the config file (~/.config/claude-dingtalk-bridge/config.yaml)
-#    (also set file permissions with `chmod 600`)
+#    (also automatically set file permissions with `chmod 600`)
 make config
-#    then edit it: client_id, client_secret, authorized_user_id, projects
+#    then manually edit it: client_id, client_secret, authorized_user_id, projects
 
 # 4. Run as a background daemon that starts at login
 #    (requires Xcode command line tools — if not installed, run `xcode-select --install` once first)

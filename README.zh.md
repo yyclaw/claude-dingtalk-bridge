@@ -23,9 +23,9 @@
 make setup
 
 # 3. 创建配置文件（~/.config/claude-dingtalk-bridge/config.yaml）
-#   （同时设置文件权限 `chmod 600`）
+#   （同时自动设置文件权限 `chmod 600`）
 make config
-#    然后编辑该文件：client_id、client_secret、authorized_user_id、projects
+#    然后手动编辑该文件：client_id、client_secret、authorized_user_id、projects
 
 # 4. 作为开机自启的后台守护进程运行
 #   （需要 Xcode 命令行工具 —— 若未安装，先执行一次 `xcode-select --install`）
