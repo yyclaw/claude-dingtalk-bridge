@@ -1,4 +1,4 @@
-# Please take care to protect the security of your data and do not disclose it to others lightly.
+# Please take care to protect the security of your data and do not disclose it to others carelessly.
 dingtalk:
   client_id: "YOUR_APP_KEY"
   client_secret: "YOUR_APP_SECRET"
@@ -9,7 +9,7 @@ authorized_user_id: "YOUR_STAFF_ID"
 # Allowed project directories (the first one is the default project).
 #
 # The bridge always appends {Edit,Write,MultiEdit,NotebookEdit}(<path>/**)
-# to the Claude Code's settings.json settings permissions.allow list each
+# to Claude Code's settings.json permissions.allow list each
 # turn (tracks /cd), so in-project edits don't escalate to the phone.
 projects:
   - name: hello-world
@@ -34,17 +34,17 @@ projects:
 #       │ no decision
 #       ▼
 #   ┌─ (2) Settings layer ────────────────────────────────────────────┐
-#   │ Claude Code merges this file with its settings.json layers      │
-#   │ (user ~/.claude/, plus per-project .claude/). Deny here is      │
-#   │ written at the highest user-controlled precedence, so it        │
-#   │ overrides allow rules in lower layers. A deny resolved here     │
-#   │ is a hard block — the call is refused without a phone ask.      │
+#   │ Claude Code merges your deny list here with its settings.json   │
+#   │ layers (user ~/.claude/, plus per-project .claude/). Deny here  │
+#   │ is written at the highest user-controlled precedence, so it     │
+#   │ overrides allow rules in lower layers. A deny resolved here is  │
+#   │ a hard block — the call is refused without a phone ask.         │
 #   └─────────────────────────────────────────────────────────────────┘
 #       │ no match
 #       ▼
 #   (3) Phone prompt via DingTalk — reply `ok` / `no`.
 #
-# Footgun:
+# Footguns:
 #  - The Bash command guard only escalates Bash; deny on a non-Bash tool is
 #    enforced solely by gate (2). Everything not pre-decided lands on the
 #    phone ask at gate (3).
