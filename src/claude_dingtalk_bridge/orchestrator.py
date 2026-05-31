@@ -935,7 +935,7 @@ class Orchestrator:
                 chip, input_preview,
             )
             await self._send_markdown(
-                f'### {icon} Permission needed\n\n{body}\n\nReply `ok` to allow, `no` to deny.'
+                f'### {icon} Permission needed\n\n{body}\n###### 　\n\nReply `👌(ok)` to allow, `❌(no)` to deny.'
             )
             start = loop.time()
             try:

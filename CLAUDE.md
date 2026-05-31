@@ -75,8 +75,12 @@ each tool call, in SDK pipeline order:
 
 1. **PreToolUse hooks** — run before settings-layer resolution, so a decision
    here cannot be short-circuited by an allow rule in any settings layer. Both
-   are **one-sided: they only ever escalate to `ask` (phone approval), never
-   return a hard deny.** Two hooks are installed:
+   are **one-sided: they only ever escalate to `ask`, never return a hard
+   deny.** Note `ask` ≠ guaranteed phone prompt: it means "I won't allow/deny —
+   continue the pipeline", and under `permission_mode=auto` the in-CLI
+   classifier (a later pipeline step — see below) can silently approve a
+   hook-`ask`ed call before it reaches the phone. The `ask`→phone guarantee
+   holds only in the deterministic modes. Two hooks are installed:
 
    - **Bash hook** (`permission_hooks.decide_bash`, always on for Bash calls),
      in order:
@@ -92,13 +96,18 @@ each tool call, in SDK pipeline order:
        wrapper; plain `rm -r` (no force) is *not* caught (use a deny rule).
      - **Unconditional escalations**: a command whose *name* is a variable
        expansion (`$CMD`, `${CMD}`, incl. inside `sh -c`) hides the program from
-       tripwires and deny matcher; a write into `.git`/`.claude`
-       (`_protected_write_reason`) via a `>`/`>>` redirect target, a file-writer
-       operand (`cp`/`mv`/`install`/`tee` positionals, `dd of=`), or any of those
-       reached by a relative path after a `cd` into the subtree (cd-targets join
-       the resolution bases). A variable as an *argument* (`rm $FILE`) is left to
-       lower layers; a write path built from a runtime expansion, or hidden in an
-       interpreter/encoding wrapper, is still out of scope.
+       tripwires and deny matcher; a write into the project's `.git`/`.claude`
+       **or the user's home `~/.claude`** (`_protected_write_reason`) via a
+       `>`/`>>` redirect target, a file-writer operand (`cp`/`mv`/`install`/`tee`
+       positionals, `dd of=`), or any of those reached by a relative path after a
+       `cd` into the subtree (cd-targets join the resolution bases; a literal `~`
+       is expanded). The home `~/.claude` guard exists because it is the global
+       Claude Code control plane (`settings.json`, `CLAUDE.md`, hooks) — Edit/Write
+       to it already escalates via `decide_edit`'s out-of-root branch, so this is
+       the matching Bash-side cover. A variable as an *argument* (`rm $FILE`) is
+       left to lower layers; a write path built from a runtime expansion
+       (`$HOME/.claude`), or hidden in an interpreter/encoding wrapper, is still
+       out of scope.
      - **Deny matching**: parses with `bashlex`, splits pipelines/chains into
        atoms, strips transparent wrappers (`exec`/`command`/`env`/`nice`/
        `timeout`/`sudo`/`xargs`/…) and recurses into both `sh -c "…"` (any `-c`
@@ -147,10 +156,19 @@ bridge's config ⇒ phone ask"; (b) the `permission_mode=auto` seen in logs come
 from that `defaultMode: auto`, not from the bridge. **`auto` is the only mode
 that interposes an in-CLI model classifier** (the other five —
 `default`/`acceptEdits`/`plan`/`bypassPermissions`/`dontAsk` — are
-deterministic): it approves/denies each otherwise-undecided call *inside the
-CLI*, so a classifier-approved call never reaches layer-3 `can_use_tool` and
-never escalates to the phone. To know a call's real fate, read every settings
-layer, not just the bridge's generated file.
+deterministic): it approves/denies calls *inside the CLI*, so a
+classifier-approved call never reaches layer-3 `can_use_tool` and never
+escalates to the phone. Per the SDK permission order (Hooks → Deny → mode →
+Allow → `can_use_tool`) the classifier sits *after* the hooks but *before*
+`can_use_tool`, so it scores not just calls the hooks passed through but also
+calls a hook escalated to `ask` (an `ask` is not a hard deny, so it continues
+down the pipeline). Verified: `cp <in-project>.md ~/.claude/auto-memory-shared/`
+is hook-`ask`ed yet auto-approved with no phone prompt, while `cp /etc/hosts
+~/.claude/<rand>` (also hook-`ask`ed) does reach the phone — the classifier
+judges each case. So under `auto` the layer-1 protected-write/tripwire guards
+only *lower the odds* of an auto-approved dangerous op; they don't guarantee a
+phone ask. To know a call's real fate, read every settings layer (not just the
+bridge's generated file) and remember the classifier can override a hook `ask`.
 
 Phone escalations and questions are serialized by `_permission_lock`, so
 parallel tool calls each get their own prompt-and-wait instead of racing a

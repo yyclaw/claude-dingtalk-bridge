@@ -269,6 +269,73 @@ def test_decide_escape_construct_pass_when_no_deny():
 
 
 @pytest.mark.parametrize(
+    "command,kind",
+    [
+        ("echo `id`", "commandsubstitution"),     # backtick substitution
+        ("(cd x && ls)", "compound"),             # subshell
+        ("if true; then ls; fi", "compound"),     # control flow: if
+        ("for f in *; do ls; done", "compound"),  # control flow: for
+    ],
+)
+def test_decide_escape_constructs_ask_when_deny_configured(command, kind):
+    # Subshells, backtick substitution and control-flow blocks hide a sub-
+    # command the atom matcher can't inspect, so the deny path escalates. (bashlex
+    # labels `if`/`for`/subshell alike as `compound`.)
+    d = decide_bash(command, _rules(deny=["Bash(rm:*)"]))
+    assert d.verdict == "ask"
+    assert f"unsupported construct ({kind})" in d.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push || echo done",            # || chain
+        "git status; ls -la",               # ; separator
+        "ls -la | grep foo",                # pipeline
+        "git commit -m 'fix; bug' && ls",   # quoted ; is not a real separator
+    ],
+)
+def test_decide_chain_separators_pass_when_no_deny_match(command):
+    # Pipelines and `&&`/`||`/`;` lists are not escape constructs; with no atom
+    # matching the deny rule they fall through. A `;` inside quotes must not be
+    # treated as a command separator.
+    assert decide_bash(command, _rules(deny=["Bash(rm:*)"])).verdict == "pass"
+
+
+# ----------------------------------------------------------------------------
+# awk / interpreter programs — a dangerous literal written in the clear inside
+# the program string is still caught by the raw-string tripwire, but a deny
+# target hidden there is invisible (the interpreter is the only atom bashlex
+# sees), mirroring the documented `node -e` bypass.
+# ----------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "awk 'BEGIN{system(\"rm -rf ~/foo\")}'",
+        "awk 'END{system(\"rm -fr /tmp/x\")}'",
+    ],
+)
+def test_decide_awk_literal_rm_caught_by_tripwire(command):
+    # The `rm -rf` literal inside the awk program is visible to the raw-string
+    # tripwire even though `awk` is the only atom bashlex parses out — no deny
+    # rule needed.
+    d = decide_bash(command, _rules())
+    assert d.verdict == "ask"
+    assert "rm -f" in d.reason
+
+
+def test_decide_awk_hidden_deny_target_not_caught():
+    # `touch` buried in the awk program is not a separate atom, so a
+    # `Bash(touch:*)` deny can't see it; without a dangerous literal on the
+    # surface the command falls through, like the `node -e` rmSync bypass.
+    d = decide_bash(
+        "awk 'BEGIN{system(\"touch /tmp/x\")}'", _rules(deny=["Bash(touch:*)"])
+    )
+    assert d.verdict == "pass"
+
+
+@pytest.mark.parametrize(
     "command",
     [
         ".venv/bin/pytest tests/test_x.py -q 2>&1 | tail -15",  # fd dup
@@ -402,6 +469,17 @@ async def test_hook_node_eval_no_literal_rm_passes():
         {},
     )
     assert out == {}
+
+
+async def test_hook_awk_literal_rm_returns_ask():
+    # `awk 'BEGIN{system("rm -rf …")}'` — the literal `rm -rf` reaches the raw-
+    # string tripwire and escalates even with no rules configured.
+    hook = make_bash_permission_hook(_rules())
+    out = await hook(
+        _input("Bash", "awk 'BEGIN{system(\"rm -rf ~/foo\")}'"), None, {}
+    )
+    assert _verdict(out) == "ask"
+    assert "rm -f" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
 # ----------------------------------------------------------------------------
@@ -753,6 +831,63 @@ def test_decide_bash_protected_writer_command_asks(tmp_path, command):
 )
 def test_decide_bash_protected_writer_command_passes_safe(tmp_path, command):
     assert decide_bash(command, _rules(), str(tmp_path)).verdict == "pass"
+
+
+# decide_bash protected-write — the user's home ~/.claude is guarded too, since
+# it is the global Claude Code control plane (defaultMode, allow, CLAUDE.md,
+# hooks). A write there is outside the project root and unmatched by any deny
+# rule, so without this guard a future Bash(cp:*) allow would wave it through.
+# ----------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    h = tmp_path / "home"
+    h.mkdir()
+    monkeypatch.setenv("HOME", str(h))
+    return h
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cp /tmp/evil ~/.claude/settings.json",         # cp destination, literal ~
+        "mv /tmp/x ~/.claude/settings.local.json",      # mv destination
+        "install -m644 /tmp/x ~/.claude/CLAUDE.md",     # install destination
+        "dd if=/tmp/x of=~/.claude/settings.json",      # dd of= operand
+        "tee ~/.claude/settings.json",                  # tee positional
+        "echo x > ~/.claude/settings.json",             # redirect, literal ~
+        "cp /tmp/x ~/.claude/projects/p/memory/m.md",   # anywhere under ~/.claude
+        "cd ~/.claude && cp /tmp/x settings.json",      # cd-relative into home claude
+    ],
+)
+def test_decide_bash_protected_home_claude_asks(tmp_path, fake_home, command):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    d = decide_bash(command, _rules(), str(proj))
+    assert d.verdict == "ask"
+    assert "protected" in d.reason
+
+
+def test_decide_bash_protected_home_claude_ignores_deny_config(tmp_path, fake_home):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    cmd = "cp /tmp/x ~/.claude/settings.json"
+    assert decide_bash(cmd, _rules(), str(proj)).verdict == "ask"
+    assert decide_bash(cmd, _rules(deny=["Bash(rm:*)"]), str(proj)).verdict == "ask"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cp /tmp/x ~/notes.txt",                    # other home file, not .claude
+        "cp /tmp/x ~/.config/x.yaml",               # sibling dotdir
+        "cp /tmp/x $HOME/.claude/settings.json",    # runtime expansion, out of scope
+    ],
+)
+def test_decide_bash_protected_home_claude_passes_safe(tmp_path, fake_home, command):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert decide_bash(command, _rules(), str(proj)).verdict == "pass"
 
 
 def test_decide_bash_no_project_path_skips_protected():

@@ -51,6 +51,16 @@ projects:
 #  - Allow rules in your lower settings layers (~/.claude/, project .claude/)
 #    stay live: a matching call auto-runs at gate (2) with no phone ask. Only
 #    `deny` here or a gate (1) escalation overrides them.
+#  - `auto` mode (defaultMode in ~/.claude/settings.json) is a real exception to
+#    gate (1)'s "escalate to a phone ask" promise. Its model classifier sits
+#    AFTER the hook but BEFORE the phone (`can_use_tool`), so a hook `ask` that
+#    isn't a hard deny passes through it; the classifier can silently approve a
+#    hook-flagged write (verified: `cp <in-project>.md ~/.claude/...` ran with no
+#    phone ask, while `cp /etc/hosts ~/.claude/<rand>` did reach the phone). So
+#    under `auto`, gate (1) only LOWERS the odds of an auto-approved dangerous
+#    op; it does not guarantee a phone ask. For a hard guarantee use a `deny`
+#    rule, or run a deterministic mode (`default` etc.) where a hook `ask`
+#    reliably reaches the phone.
 permissions:
   # Same syntax as Claude Code's settings.json permissions.deny. Empty is
   # fine — the built-in tripwires still catch the obvious catastrophic forms.

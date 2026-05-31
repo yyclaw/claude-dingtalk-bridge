@@ -504,7 +504,7 @@ def _cd_targets(trees, base: Path) -> list[Path]:
             if not dirs:
                 continue
             try:
-                out.append((base / dirs[0]).resolve())
+                out.append((base / Path(dirs[0]).expanduser()).resolve())
             except (OSError, RuntimeError):
                 continue
     return out
@@ -518,27 +518,37 @@ def _protected_hit(target: str, bases: list[Path], guarded: list[Path]) -> str:
     """
     for base in bases:
         try:
-            resolved = (base / target).resolve()
+            resolved = (base / Path(target).expanduser()).resolve()
         except (OSError, RuntimeError):
             return "write path resolution failed"
         if any(resolved.is_relative_to(g) for g in guarded):
-            return "writes into protected dir (.git/.claude)"
+            return "writes into protected dir (.git/.claude or ~/.claude)"
     return ""
 
 
 def _protected_write_reason(command: str, project_path: str) -> str:
-    """Return a reason if ``command`` writes into the project's .git/.claude.
+    """Return a reason if ``command`` writes into a protected dir.
+
+    Guarded dirs are the project's own ``.git``/``.claude`` *and* the user's
+    home ``~/.claude`` — the latter is the global Claude Code control plane
+    (``settings.json``'s ``defaultMode``/``allow``, ``CLAUDE.md``, hooks), so a
+    write there could rewrite the approval model for every project at once. Edit/
+    Write tools already escalate any out-of-root target via :func:`decide_edit`;
+    this closes the matching Bash path, which otherwise falls through to the
+    settings layer where a future ``Bash(cp:*)`` allow (or the auto classifier)
+    could wave a ``cp``/``mv`` into ``~/.claude`` through.
 
     Runs unconditionally (independent of the deny list and of the deny-gated
-    redirect escalation), so a write that plants a git hook or rewrites
-    ``.claude/settings.json`` always reaches the phone — even if redirect gating
-    is relaxed later. Covered write surfaces: ``>``/``>>`` redirect targets,
+    redirect escalation), so a write that plants a git hook or rewrites a
+    ``settings.json`` always reaches the phone — even if redirect gating is
+    relaxed later. Covered write surfaces: ``>``/``>>`` redirect targets,
     file-writer command operands (``cp``/``mv``/``install``/``tee`` positionals,
-    ``dd of=``), and any of those reached via a relative path after a
-    ``cd`` into a guarded subtree (``cd``-targets join the resolution bases).
-    Still out of scope, same as the tripwires: a write whose path is built from
-    a runtime expansion, or an interpreter/encoding wrapper that hides the write
-    entirely. A parse failure stays permissive so auto-mode isn't broken.
+    ``dd of=``), and any of those reached via a relative path after a ``cd``
+    into a guarded subtree (``cd``-targets join the resolution bases). A literal
+    ``~`` in the target is expanded; still out of scope, same as the tripwires:
+    a write whose path is built from a runtime expansion (``$HOME``), or an
+    interpreter/encoding wrapper that hides the write entirely. A parse failure
+    stays permissive so auto-mode isn't broken.
     """
     try:
         trees = bashlex.parse(command)
@@ -547,6 +557,7 @@ def _protected_write_reason(command: str, project_path: str) -> str:
     base = Path(project_path).expanduser()
     try:
         guarded = [(base / d).resolve() for d in _PROTECTED_DIRS]
+        guarded.append((Path.home() / ".claude").resolve())
     except (OSError, RuntimeError):
         return ""
     bases = [base, *_cd_targets(trees, base)]
