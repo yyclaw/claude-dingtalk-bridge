@@ -129,13 +129,28 @@ each tool call, in SDK pipeline order:
    (`Edit(<cwd>/**)`, …) into a JSON file passed as
    `ClaudeAgentOptions(settings=...)`. The SDK applies these before any Python
    runs, and merges them with lower settings layers; the bridge's flag-layer
-   deny wins on conflict. A deny resolved here is a **hard block the CLI
+   deny wins on conflict. A deny resolved here is a **hard block the Claude Code
+   CLI (the `claude` subprocess the SDK spawns, not this repo's `cli.py`)
    enforces directly** — `can_use_tool` is never invoked and the model just
    receives the tool denial; this is the only layer that hard-denies a tool.
 3. **`can_use_tool` callback** (`ClaudeRunner`) — fires only for calls the
    first two layers didn't decide (including a layer-1 `ask`). It has no rules
    of its own; the call goes straight to `permission_handler` (the phone ask).
    `AskUserQuestion` is intercepted separately and routed to `question_handler`.
+
+The Claude Code CLI also merges **lower settings layers the bridge never writes** — notably
+the user's `~/.claude/settings.json`, which carries its own `permissions.allow`
+(e.g. `Bash(git commit:*)`) and a `defaultMode`. Two consequences when reasoning
+about whether a call reaches the phone: (a) a tool can be allowed by a lower
+layer even though the bridge adds no allow for it, so never assume "not in the
+bridge's config ⇒ phone ask"; (b) the `permission_mode=auto` seen in logs comes
+from that `defaultMode: auto`, not from the bridge. **`auto` is the only mode
+that interposes an in-CLI model classifier** (the other five —
+`default`/`acceptEdits`/`plan`/`bypassPermissions`/`dontAsk` — are
+deterministic): it approves/denies each otherwise-undecided call *inside the
+CLI*, so a classifier-approved call never reaches layer-3 `can_use_tool` and
+never escalates to the phone. To know a call's real fate, read every settings
+layer, not just the bridge's generated file.
 
 Phone escalations and questions are serialized by `_permission_lock`, so
 parallel tool calls each get their own prompt-and-wait instead of racing a

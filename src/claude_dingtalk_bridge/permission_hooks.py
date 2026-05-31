@@ -381,6 +381,11 @@ def _matched_deny_rule(argv: list[str], deny_rules: list[str]) -> str:
 def _deny_atom(command: str, deny_rules: list[str]) -> str:
     """Return a reason if any atom in ``command`` matches a user deny rule.
 
+    The reason is self-describing so the caller can surface it verbatim: a real
+    hit reads ``matches deny rule <rule>``, while a conservative escalation names
+    its own cause (``unparseable command``, ``unsupported construct (…)``,
+    ``opaque wrapper option``) rather than masquerading as a rule match.
+
     Unparseable input and escape constructs (subshell, file redirect,
     heredoc, …) are treated as opaque and trigger an ask, since we can't tell
     whether the hidden sub-command would have matched. Benign redirects (fd
@@ -418,7 +423,7 @@ def _deny_atom(command: str, deny_rules: list[str]) -> str:
             continue
         matched = _matched_deny_rule(argv, deny_rules)
         if matched:
-            return matched
+            return f"matches deny rule {matched}"
     return ""
 
 
@@ -588,9 +593,9 @@ def decide_bash(
             return Decision("ask", protected)
     if rules is None or not rules.deny:
         return Decision("pass")
-    matched = _deny_atom(command, rules.deny)
-    if matched:
-        return Decision("ask", f"matches deny rule {matched}")
+    reason = _deny_atom(command, rules.deny)
+    if reason:
+        return Decision("ask", reason)
     return Decision("pass")
 
 
