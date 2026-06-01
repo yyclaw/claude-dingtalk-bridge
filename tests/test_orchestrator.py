@@ -6,7 +6,7 @@ import pytest
 
 import claude_dingtalk_bridge.orchestrator as orch_mod
 from claude_dingtalk_bridge.claude_runner import ResultEvent, TextEvent, ToolEvent
-from claude_dingtalk_bridge.config import Config, PermissionRules, Project
+from claude_dingtalk_bridge.config import Config, Project
 from claude_dingtalk_bridge.orchestrator import Orchestrator
 from claude_dingtalk_bridge.projects import ProjectRegistry
 
@@ -38,8 +38,7 @@ def make_config() -> Config:
             Project(name="multica", path="/tmp/multica"),
             Project(name="docs", path="/tmp/docs"),
         ],
-        permissions=PermissionRules(deny=[]),
-        permission_timeout_seconds=600,
+        permission_ask_timeout=600,
     )
 
 
@@ -334,7 +333,7 @@ async def test_permission_escalates_and_resolves_on_deny():
 
 async def test_permission_timeout_denies():
     orchestrator, runner, sent = build()
-    orchestrator._config.permission_timeout_seconds = 0
+    orchestrator._config.permission_ask_timeout = 0
     result = await orchestrator.request_permission("Bash", {"command": "rm x"})
     assert result is False
     assert any("timed out" in m for m in sent)
@@ -376,24 +375,6 @@ async def test_permission_prompt_wraps_command_in_code_fence():
         line.lstrip().startswith("# ") and not line.lstrip().startswith("###")
         for line in outside.splitlines()
     )
-
-
-async def test_permission_prompt_flags_dangerous_bash_command():
-    """A tripwire-matched Bash command swaps the lock for a louder ‼️."""
-    orchestrator, _, _, md_sent = build_channels()
-
-    async def approve_soon():
-        while orchestrator._permission_future is None or orchestrator._permission_future.done():
-            await asyncio.sleep(0)
-        await orchestrator.handle_message("ok", AUTHORIZED)
-
-    await asyncio.gather(
-        orchestrator.request_permission("Bash", {"command": "rm -rf /tmp/x"}),
-        approve_soon(),
-    )
-    prompt = next(m for m in md_sent if "Permission needed" in m)
-    assert "‼️" in prompt
-    assert "🔐" not in prompt
 
 
 async def test_permission_prompt_keeps_lock_for_ordinary_command():
@@ -660,7 +641,7 @@ async def test_askuserquestion_multiple_questions():
 
 async def test_askuserquestion_timeout():
     orchestrator, runner, sent = build()
-    orchestrator._config.permission_timeout_seconds = 0
+    orchestrator._config.permission_ask_timeout = 0
     answer = await orchestrator.answer_question(_DB_QUESTION, "/tmp/multica")
     assert "did not answer" in answer
     assert any("timed out" in m for m in sent)
@@ -1791,7 +1772,7 @@ async def test_request_permission_logs_timeout(caplog, monkeypatch):
     import logging
     orchestrator, _runner, _sent = build()
     # Squash the long default timeout so the test doesn't actually wait.
-    monkeypatch.setattr(orchestrator._config, "permission_timeout_seconds", 0.05)
+    monkeypatch.setattr(orchestrator._config, "permission_ask_timeout", 0.05)
     with caplog.at_level(logging.INFO, logger="claude_dingtalk_bridge.orchestrator"):
         result = await orchestrator.request_permission(
             "Bash", {"command": "rm -rf /tmp/x"}

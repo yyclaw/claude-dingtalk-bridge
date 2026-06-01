@@ -39,7 +39,3 @@ make logs-web
 ### 手机端
 
 与你创建的机器人单聊，发送 `/help` 查看所有支持的指令。
-
-## 安全设计
-
-详见 `config.example.yaml` 内注释。

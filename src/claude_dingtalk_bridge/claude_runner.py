@@ -28,16 +28,9 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
-from pathlib import Path
-
 from claude_dingtalk_bridge import log_context
-from claude_dingtalk_bridge.config import PermissionRules
 from claude_dingtalk_bridge.display import collapse_inline_paths, display_path, format_tokens
-from claude_dingtalk_bridge.permission_hooks import (
-    make_bash_permission_hook,
-    make_edit_path_hook,
-)
-from claude_dingtalk_bridge.permissions import write_permission_settings_file
+from claude_dingtalk_bridge.permission_hooks import make_bash_permission_hook
 from claude_dingtalk_bridge.questions import question_preview
 
 logger = logging.getLogger(__name__)
@@ -1034,8 +1027,6 @@ class ClaudeRunner:
 
     def __init__(self):
         self.permission_handler: PermissionHandler | None = None
-        self.permission_rules: PermissionRules | None = None
-        self.settings_file_path: Path | None = None
         self.question_handler: QuestionHandler | None = None
         self._session_ids: dict[str, str] = {}
         self._active_client: ClaudeSDKClient | None = None
@@ -1291,26 +1282,11 @@ class ClaudeRunner:
             "preset": "claude_code",
             "exclude_dynamic_sections": True,
         }
-        # Re-render per turn — the in-project edit allow expands to
-        # Edit(<cwd>/**) so the file changes whenever /cd switches projects.
-        if self.permission_rules is not None and self.settings_file_path is not None:
-            write_permission_settings_file(
-                self.permission_rules, project_path, self.settings_file_path
-            )
-            kwargs["settings"] = str(self.settings_file_path)
         kwargs["hooks"] = {
             "PreToolUse": [
                 HookMatcher(
                     matcher="Bash",
-                    hooks=[
-                        make_bash_permission_hook(
-                            self.permission_rules, project_path
-                        )
-                    ],
-                ),
-                HookMatcher(
-                    matcher="Edit|Write|MultiEdit|NotebookEdit",
-                    hooks=[make_edit_path_hook(project_path)],
+                    hooks=[make_bash_permission_hook()],
                 ),
             ],
         }

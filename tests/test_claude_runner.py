@@ -1,7 +1,4 @@
-import json
-
 from claude_dingtalk_bridge.claude_runner import ClaudeRunner, tool_summary
-from claude_dingtalk_bridge.config import PermissionRules
 
 
 def test_tool_summary_for_bash():
@@ -2573,7 +2570,6 @@ async def test_can_use_tool_falls_through_to_handler_on_ask():
     from claude_agent_sdk import PermissionResultAllow
 
     runner = ClaudeRunner()
-    runner.permission_rules = PermissionRules(deny=[])
     called = []
 
     async def permission_handler(tool_name, input_data, project_path):
@@ -3113,44 +3109,25 @@ async def test_drain_returns_when_cancel_set_after_consume(monkeypatch):
     )
 
 
-def _perm_rules() -> PermissionRules:
-    return PermissionRules(deny=["Bash(rm -rf:*)"])
-
-
-def test_build_options_writes_settings_file_and_passes_path(tmp_path):
+def test_build_options_registers_pretooluse_hook():
     runner = ClaudeRunner()
-    runner.permission_rules = _perm_rules()
-    runner.settings_file_path = tmp_path / "perms.json"
-    options = runner._build_options("/Users/me/proj")
-    assert options.settings == str(tmp_path / "perms.json")
-    payload = json.loads((tmp_path / "perms.json").read_text())
-    allow = payload["permissions"]["allow"]
-    assert "Edit(/Users/me/proj/**)" in allow
-    assert payload["permissions"]["deny"] == ["Bash(rm -rf:*)"]
-
-
-def test_build_options_registers_pretooluse_hook(tmp_path):
-    runner = ClaudeRunner()
-    runner.permission_rules = _perm_rules()
-    runner.settings_file_path = tmp_path / "perms.json"
     options = runner._build_options("/Users/me/proj")
     assert options.hooks is not None
     matchers = options.hooks.get("PreToolUse") or []
     assert any(m.matcher == "Bash" for m in matchers), (
-        "Bridge must register a PreToolUse hook matched on Bash for the "
-        "metacharacter check; without it, settings.json allow rules can "
-        "short-circuit the bridge's escalation."
+        "Bridge must register a PreToolUse hook matched on Bash so the "
+        "tripwire and variable-command guard run before any settings-layer "
+        "allow rule can short-circuit them."
     )
 
 
-def test_build_options_regenerates_settings_per_cwd(tmp_path):
+def test_build_options_installs_only_bash_hook_and_no_settings_file():
+    # The bridge installs exactly ONE PreToolUse hook (Bash). The edit-path
+    # hook and the per-turn permission settings file were removed; path-level
+    # rules now live in the user's own Claude Code settings layers. Assert their
+    # absence so an accidental re-introduction of either is caught.
     runner = ClaudeRunner()
-    runner.permission_rules = _perm_rules()
-    runner.settings_file_path = tmp_path / "perms.json"
-    runner._build_options("/Users/me/proj-A")
-    a = json.loads((tmp_path / "perms.json").read_text())
-    runner._build_options("/Users/me/proj-B")
-    b = json.loads((tmp_path / "perms.json").read_text())
-    assert "Edit(/Users/me/proj-A/**)" in a["permissions"]["allow"]
-    assert "Edit(/Users/me/proj-A/**)" not in b["permissions"]["allow"]
-    assert "Edit(/Users/me/proj-B/**)" in b["permissions"]["allow"]
+    options = runner._build_options("/Users/me/proj")
+    matchers = options.hooks.get("PreToolUse") or []
+    assert [m.matcher for m in matchers] == ["Bash"]
+    assert options.settings is None

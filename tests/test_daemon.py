@@ -3,7 +3,7 @@ import contextlib
 
 import websockets
 
-from claude_dingtalk_bridge.config import Config, GeoConfig, PermissionRules, Project
+from claude_dingtalk_bridge.config import Config, GeoConfig, Project
 from claude_dingtalk_bridge.daemon import (
     _ChatHandler,
     _disable_websocket_proxy,
@@ -21,7 +21,6 @@ def make_config() -> Config:
         dingtalk_client_secret="s",
         authorized_user_id="staff-1",
         projects=[Project(name="p", path="/tmp/p")],
-        permissions=PermissionRules(deny=[]),
     )
 
 
@@ -1026,28 +1025,6 @@ async def test_serve_stream_once_propagates_cancel(monkeypatch):
     # Keepalive was started and must have been cancelled in the finally block.
     assert client.keepalive_started
     assert client.keepalive_cancelled
-
-
-def test_build_orchestrator_wires_permission_rules_onto_runner():
-    """Runner must receive the parsed permission rules and a settings file path so
-    _build_options can write the flag-layer JSON on the very first turn."""
-    from pathlib import Path
-
-    from claude_dingtalk_bridge.daemon import build_orchestrator
-    from claude_dingtalk_bridge.config import Config, PermissionRules, Project
-
-    config = Config(
-        dingtalk_client_id="cid",
-        dingtalk_client_secret="csec",
-        authorized_user_id="uid",
-        projects=[Project(name="p", path="/tmp")],
-        permissions=PermissionRules(deny=["Bash(rm -rf:*)"]),
-    )
-    orch, _transport = build_orchestrator(config)
-    runner = orch._runner
-    assert runner.permission_rules is config.permissions
-    assert isinstance(runner.settings_file_path, Path)
-    assert runner.settings_file_path.name == "permissions.json"
 
 
 def test_extract_title_skips_leading_blank_lines():

@@ -17,7 +17,7 @@ from dingtalk_stream.stream import DingTalkStreamClient
 from dingtalk_stream.version import VERSION_STRING
 
 from claude_dingtalk_bridge.claude_runner import ClaudeRunner
-from claude_dingtalk_bridge.config import CACHE_DIR, Config, load_config
+from claude_dingtalk_bridge.config import Config, load_config
 from claude_dingtalk_bridge.dingtalk import DingTalkTransport
 from claude_dingtalk_bridge.display import display_path
 from claude_dingtalk_bridge.geo import CachedGeoCheck
@@ -116,8 +116,6 @@ def build_orchestrator(config: Config) -> tuple[Orchestrator, DingTalkTransport]
         await asyncio.to_thread(transport.send_markdown, user_id, title, text)
 
     runner = ClaudeRunner()
-    runner.permission_rules = config.permissions
-    runner.settings_file_path = CACHE_DIR / "permissions.json"
 
     geo_check = None
     if config.geo is not None:

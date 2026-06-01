@@ -20,11 +20,6 @@ class Project:
 
 
 @dataclass
-class PermissionRules:
-    deny: list[str]
-
-
-@dataclass
 class GeoConfig:
     proxy_url: str = "http://127.0.0.1:8118"
     target_country: str = "US"
@@ -38,8 +33,7 @@ class Config:
     dingtalk_client_secret: str
     authorized_user_id: str
     projects: list[Project]
-    permissions: PermissionRules
-    permission_timeout_seconds: int = 600
+    permission_ask_timeout: int = 600
     geo: GeoConfig | None = None
 
 
@@ -64,10 +58,6 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
             Project(name=str(p["name"]), path=str(Path(p["path"]).expanduser()))
             for p in raw["projects"]
         ]
-        perms_raw = raw.get("permissions", {}) or {}
-        perms = PermissionRules(
-            deny=[str(x) for x in perms_raw.get("deny", [])],
-        )
         geo = None
         if "geo" in raw:
             geo_raw = raw["geo"] or {}
@@ -82,8 +72,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
             dingtalk_client_secret=str(dingtalk["client_secret"]),
             authorized_user_id=str(raw["authorized_user_id"]),
             projects=projects,
-            permissions=perms,
-            permission_timeout_seconds=int(raw.get("permission_timeout_seconds", 600)),
+            permission_ask_timeout=int(raw.get("permission_ask_timeout", 600)),
             geo=geo,
         )
     except (KeyError, TypeError) as exc:

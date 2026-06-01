@@ -10,4 +10,3 @@ config.yaml
 .coverage
 htmlcov/
 docs/
-scripts/check_bash_permissions.py

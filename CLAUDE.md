@@ -12,10 +12,13 @@ Code turns and escalates risky operations back to the phone for approval.
 `make` (no args) lists everything. Key ones:
 
 - `make setup` — create `.venv`, `pip install -e ".[dev]"`
+- `make config` — write `config.yaml` from the template if absent
 - `make test` — `pytest -q --cov` (with a branch-coverage summary)
+- `make start` — run the daemon in the foreground (logs to terminal)
 - `make daemon-*` — launchd lifecycle (install/uninstall/start/stop/restart/status)
 - `make logs-tail` — tail daemon logs; `make logs-web ARGS=...` — browser live-viewer
   (`scripts/log_server.py`, date-range filtering via `--since`/`--until`)
+- `make check` — smoke-test the Bash permission hook against a table of commands
 
 Single test: `.venv/bin/pytest tests/test_orchestrator.py -q` (append
 `::test_name`). `pytest-asyncio` runs in `auto` mode — async tests need no
@@ -67,130 +70,31 @@ Single-threaded async coordinator holding all mutable session state.
 
 ### Permissions
 
-The bridge's config carries only a `deny` list — there is no user-configurable
-allow list. Edit-shaped tools (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`) are
-auto-allowed inside the active project root (with exceptions — see the edit-path
-hook below); everything else falls through to the phone prompt. Three layers gate
-each tool call, in SDK pipeline order:
+Two independent layers gate tool use:
 
-1. **PreToolUse hooks** — run before settings-layer resolution, so a decision
-   here cannot be short-circuited by an allow rule in any settings layer. Both
-   are **one-sided: they only ever escalate to `ask`, never return a hard
-   deny.** Note `ask` ≠ guaranteed phone prompt: it means "I won't allow/deny —
-   continue the pipeline", and under `permission_mode=auto` the in-CLI
-   classifier (a later pipeline step — see below) can silently approve a
-   hook-`ask`ed call before it reaches the phone. The `ask`→phone guarantee
-   holds only in the deterministic modes. Two hooks are installed:
+- **Interactive approval** — the SDK's `can_use_tool` callback routes risky
+  operations to `orchestrator.request_permission`, which asks the phone
+  (`ok`/`no` resolves it); `AskUserQuestion` routes to `answer_question` the
+  same way.
+- **Hard-deny hook** (`permission_hooks.py`) — a `PreToolUse` Bash hook
+  (`make_bash_permission_hook`) that blocks a fixed set of catastrophic literals
+  (`rm -rf` incl. split flags, `find -delete`, `dd of=/dev/…`, `newfs`,
+  `diskutil`/`asr`/`gpt` destructive verbs, fork bomb, redirect to a block
+  device) and variable-substituted command names (`$CMD`). It parses with `bashlex` and
+  recurses into `bash -c`/`eval`. It returns `deny` — the only verdict that holds
+  across every `permission_mode`, so no settings allow-rule or `bypassPermissions`
+  can undo it. Path-level rules (`Bash(rm:*)`) are *not* here — those live in
+  Claude Code's own settings layers. `make check` smoke-tests the guard
+  (`scripts/check_bash_permissions.py`).
 
-   - **Bash hook** (`permission_hooks.decide_bash`, always on for Bash calls),
-     in order:
-     - **Tripwires** (fire even when `deny` is empty): `rm -f`/`-rf` (force in
-       any short-flag group, bundled or split like `rm -r -f`), `rm --force`,
-       `dd of=/dev/*`, `mkfs`, redirect to a raw block device, fork bomb.
-       Matched twice — raw string (backstop, also covers parse failure + the
-       structural fork bomb) then the `bashlex`-parsed command
-       (`_parsed_tripwire`), which basename-normalizes the program and rebuilds
-       the atom from unquoted words, so `"rm" -rf` / `/bin/rm` / `mk''fs` /
-       `of="/dev/sda"` no longer slip past. Still evaded by a runtime expansion
-       hiding a flag (`$IFS`, `$'\x2d\x72\x66'`), encoding, or interpreter
-       wrapper; plain `rm -r` (no force) is *not* caught (use a deny rule).
-     - **Unconditional escalations**: a command whose *name* is a variable
-       expansion (`$CMD`, `${CMD}`, incl. inside `sh -c`) hides the program from
-       tripwires and deny matcher; a write into the project's `.git`/`.claude`
-       **or the user's home `~/.claude`** (`_protected_write_reason`) via a
-       `>`/`>>` redirect target, a file-writer operand (`cp`/`mv`/`install`/`tee`
-       positionals, `dd of=`), or any of those reached by a relative path after a
-       `cd` into the subtree (cd-targets join the resolution bases; a literal `~`
-       is expanded). The home `~/.claude` guard exists because it is the global
-       Claude Code control plane (`settings.json`, `CLAUDE.md`, hooks) — Edit/Write
-       to it already escalates via `decide_edit`'s out-of-root branch, so this is
-       the matching Bash-side cover. A variable as an *argument* (`rm $FILE`) is
-       left to lower layers; a write path built from a runtime expansion
-       (`$HOME/.claude`), or hidden in an interpreter/encoding wrapper, is still
-       out of scope.
-     - **Deny matching**: parses with `bashlex`, splits pipelines/chains into
-       atoms, strips transparent wrappers (`exec`/`command`/`env`/`nice`/
-       `timeout`/`sudo`/`xargs`/…) and recurses into both `sh -c "…"` (any `-c`
-       group, e.g. `-cl`) and `eval "…"`, then checks each atom against
-       `rules.deny` — so `Bash(rm:*)` catches `cd /tmp && bash -c "rm -rf /foo"`. A
-       path-prefixed program is matched on its basename too (`Bash(rm:*)` ⇒
-       `/bin/rm`, `./rm`), while an explicit `Bash(/bin/rm:*)` still matches the
-       path form.
-     - **Degrade to `ask`** (when deny rules are set): unmodeled wrapper flags
-       (`exec -a`, `command -p`, `env -i`/`-u`, `sudo -u`, `xargs -0`) leave the
-       atom opaque; unparseable input; opaque constructs (subshell, process/
-       command substitution, file redirect, heredoc, compound, `if`/`for`/
-       `while`/`until`/`case`/`function`). Benign redirects (fd dups,
-       `/dev/null`) are exempt. Anything else returns `{}` and falls through.
-   - **Edit-path hook** (`permission_hooks.decide_edit`, on for the four
-     edit-shaped tools). The settings layer auto-allows `Edit(<cwd>/**)` by
-     *textual* glob, which a `..` segment or an in-tree symlink can slip past;
-     this hook resolves the target and the project root and escalates to `ask`
-     when the resolved target lands outside the root (a resolution failure, e.g.
-     a symlink loop, also escalates), or inside a protected subdir
-     (`.git`/`.claude`) where an in-tree edit could plant a git hook or inject
-     allow rules. Other in-project targets return `{}` and let the settings
-     allow auto-approve them.
+### Geo gate (optional)
 
-   Anything a hook leaves at `{}` falls through to layer 2.
-2. **Claude Agent SDK settings rules** — `permissions.write_permission_settings_file`
-   serializes the bridge's deny list plus the in-project edit expansion
-   (`Edit(<cwd>/**)`, …) into a JSON file passed as
-   `ClaudeAgentOptions(settings=...)`. The SDK applies these before any Python
-   runs, and merges them with lower settings layers; the bridge's flag-layer
-   deny wins on conflict. A deny resolved here is a **hard block the Claude Code
-   CLI (the `claude` subprocess the SDK spawns, not this repo's `cli.py`)
-   enforces directly** — `can_use_tool` is never invoked and the model just
-   receives the tool denial; this is the only layer that hard-denies a tool.
-3. **`can_use_tool` callback** (`ClaudeRunner`) — fires only for calls the
-   first two layers didn't decide (including a layer-1 `ask`). It has no rules
-   of its own; the call goes straight to `permission_handler` (the phone ask).
-   `AskUserQuestion` is intercepted separately and routed to `question_handler`.
-
-The Claude Code CLI also merges **lower settings layers the bridge never writes** — notably
-the user's `~/.claude/settings.json`, which carries its own `permissions.allow`
-(e.g. `Bash(git commit:*)`) and a `defaultMode`. Two consequences when reasoning
-about whether a call reaches the phone: (a) a tool can be allowed by a lower
-layer even though the bridge adds no allow for it, so never assume "not in the
-bridge's config ⇒ phone ask"; (b) the `permission_mode=auto` seen in logs comes
-from that `defaultMode: auto`, not from the bridge. **`auto` is the only mode
-that interposes an in-CLI model classifier** (the other five —
-`default`/`acceptEdits`/`plan`/`bypassPermissions`/`dontAsk` — are
-deterministic): it approves/denies calls *inside the CLI*, so a
-classifier-approved call never reaches layer-3 `can_use_tool` and never
-escalates to the phone. Per the SDK permission order (Hooks → Deny → mode →
-Allow → `can_use_tool`) the classifier sits *after* the hooks but *before*
-`can_use_tool`, so it scores not just calls the hooks passed through but also
-calls a hook escalated to `ask` (an `ask` is not a hard deny, so it continues
-down the pipeline). Verified: `cp <in-project>.md ~/.claude/auto-memory-shared/`
-is hook-`ask`ed yet auto-approved with no phone prompt, while `cp /etc/hosts
-~/.claude/<rand>` (also hook-`ask`ed) does reach the phone — the classifier
-judges each case. So under `auto` the layer-1 protected-write/tripwire guards
-only *lower the odds* of an auto-approved dangerous op; they don't guarantee a
-phone ask. To know a call's real fate, read every settings layer (not just the
-bridge's generated file) and remember the classifier can override a hook `ask`.
-
-Phone escalations and questions are serialized by `_permission_lock`, so
-parallel tool calls each get their own prompt-and-wait instead of racing a
-shared future. An escalation default-denies after `permission_timeout_seconds`
-(config, 600s); tripwire-matched Bash shows a louder `‼️` icon vs the routine
-`🔐`. `scripts/check_bash_permissions.py` is a standalone harness for exercising
-`decide_bash` by hand.
-
-`/mode` overrides the SDK `permission_mode` for subsequent turns
-(`acceptEdits`/`bypassPermissions`/`plan`/`dontAsk`/`default`/`auto`, or `reset`
-to fall back to the TUI's settings). `bypassPermissions` skips the layer-3 phone
-ask entirely, so it disables the approval model — use with care.
-
-### Geo gate
-
-With a `geo` section in `config.yaml`, `build_orchestrator` wires a `geo_check`
-callable into the orchestrator and `proxy_url` into `ClaudeRunner`. `_run` checks
-the exit IP's country (`geo.check_geo`, via the local proxy) before each turn and
-skips + notifies on a mismatch. The check runs *before* the debug short-circuit,
-so `/debug on` still exercises it. The proxy applies only to the geo request and
-the Claude subprocess (`ClaudeAgentOptions.env`) — never `os.environ`, so the
-DingTalk REST push stays direct. No `geo` section → all of this is off.
+If config carries a `geo:` block, each turn first checks the exit IP's country
+through the configured proxy (`geo.py`, result cached briefly). A mismatch with
+`target_country` appends a warning to the task-started notice but does **not**
+block the turn. `geo.proxy_url` is also pushed into Claude's subprocess env
+(`http_proxy`/`https_proxy`) so its traffic shares the proxy. Omit the section to
+skip both the check and the proxy.
 
 ### Sessions
 
@@ -207,24 +111,23 @@ session produced by the desktop TUI, enabling cross-device handoff.
 ### Stream reconnect
 
 `stream_reconnect.ReconnectState` is a backoff machine for the DingTalk Stream
-WebSocket (`daemon` reconnect loop). The gateway penalizes rapid reconnects with
-prolonged lockouts (~30 min observed) and doesn't queue inbound messages while
-the bot is offline, so the SDK's flat 10s retry can turn a blip into a long
-outage. Delays climb `10→30→90→300s` with jitter; a connection that stayed up
-≥`stable_threshold` (60s) resets the count.
+WebSocket (`daemon` reconnect loop). The gateway locks out rapid reconnects
+(~30 min observed) and drops inbound messages while offline, so the SDK's flat
+10s retry can stretch a blip into a long outage. Delays climb `10→30→90→300s`
+with jitter; a connection up ≥`stable_threshold` (60s) resets the count.
 
 ### Daemon packaging (`launchd.py`)
 
 macOS 26 forbids regular processes from writing `~/Library/LaunchAgents`, so
-`make daemon-install` builds an `~/Applications/Claude DingTalk Bridge.app`
-bundle (Info.plist, ad-hoc-signed) with the agent plist nested at
-`Contents/Library/LaunchAgents/` and a Swift helper (`resources/AppHelper.swift`,
-compiled at install via `xcrun swiftc`) that registers the service through
-SMAppService and execs the daemon. Install failures usually trace to a missing
-`xcode-select` toolchain. `make daemon-start` runs `launchctl kickstart` on
-`gui/<uid>/<label>` (falling back to `bootstrap gui/<uid> <plist>` when the
-service was booted out), `stop` runs `bootout`, and `restart` runs `kickstart
--k` — never touch `~/Library/LaunchAgents` by hand.
+`make daemon-install` builds an ad-hoc-signed `~/Applications/Claude DingTalk
+Bridge.app` bundle (Info.plist) with the agent plist nested at
+`Contents/Library/LaunchAgents/`; a Swift helper (`resources/AppHelper.swift`,
+compiled at install via `xcrun swiftc`) registers the service through
+SMAppService and execs the daemon. Install failures usually mean a missing
+`xcode-select` toolchain. `daemon-start` runs `launchctl kickstart
+gui/<uid>/<label>` (falling back to `bootstrap gui/<uid> <plist>` when booted
+out), `stop` runs `bootout`, `restart` runs `kickstart -k` — never touch
+`~/Library/LaunchAgents` by hand.
 
 `cli.py._notify_phone` pushes a notice on `start`/`stop`/`restart`. The daemon
 can't tell stop from restart (both arrive as SIGTERM), so these labels live at
@@ -236,24 +139,22 @@ the CLI boundary where intent is unambiguous.
 `session=<8-char> turn=<n>` (`log_context` contextvars), so `grep session=…`
 slices one session's full trace out of multi-project streams. Tool calls render
 as `<name>#<8-char id>` (via `_short_tool_id`) so a request and its result pair
-by eye. INFO/DEBUG → stdout, WARNING+ → stderr; `make logs-tail` shows both, `make
-logs-web` serves a browser live-viewer (`scripts/log_server.py`, date-range
-filtering).
+by eye. INFO/DEBUG → stdout, WARNING+ → stderr; `make logs-tail` shows both,
+`make logs-web` serves the live-viewer.
 
 ### Prompt caching
 
 `ClaudeRunner._build_options` keeps the cached system-prompt prefix byte-stable:
-it requests the `claude_code` preset with `exclude_dynamic_sections` (the dynamic
-git-status block would otherwise change the prefix every turn) and sets
-`ENABLE_PROMPT_CACHING_1H`, since phone turns are minutes apart and the default
-5-minute window is almost always cold. `record_usage` tallies token usage per
-project; `/status` shows the running total and the last turn's cache read/write
-breakdown.
+the `claude_code` preset with `exclude_dynamic_sections` (the dynamic git-status
+block would otherwise change the prefix every turn), plus `ENABLE_PROMPT_CACHING_1H`
+because phone turns are minutes apart and the default 5-minute window is usually
+cold. `record_usage` tallies tokens per project; `/status` shows the running
+total and the last turn's cache read/write breakdown.
 
 ## Conventions
 
 - Config: `~/.config/claude-dingtalk-bridge/config.yaml` (see
-  `config.example.yaml`); `config.py` parses it into frozen-ish dataclasses,
+  `config.example.yaml`); `config.py` parses it into dataclasses,
   raising `ConfigError` on anything missing.
 - Everything is in English — phone strings, code, logs, comments. Phone messages
   lead with one emoji icon and use short bulleted lines.

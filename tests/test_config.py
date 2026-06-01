@@ -12,10 +12,7 @@ authorized_user_id: staff789
 projects:
   - name: multica
     path: ~/Projects/marmot-multica
-permissions:
-  deny:
-    - "Bash(rm -rf:*)"
-permission_timeout_seconds: 300
+permission_ask_timeout: 300
 """
 
 
@@ -25,11 +22,10 @@ def test_load_valid_config(write_config):
     assert config.dingtalk_client_id == "appkey123"
     assert config.dingtalk_client_secret == "secret456"
     assert config.authorized_user_id == "staff789"
-    assert config.permission_timeout_seconds == 300
+    assert config.permission_ask_timeout == 300
     assert len(config.projects) == 1
     assert config.projects[0].name == "multica"
     assert config.projects[0].path == str(Path("~/Projects/marmot-multica").expanduser())
-    assert config.permissions.deny == ["Bash(rm -rf:*)"]
 
 
 def test_missing_file_raises(tmp_path):
@@ -66,8 +62,7 @@ projects:
     path: /tmp/p
 """
     config = load_config(write_config(minimal))
-    assert config.permission_timeout_seconds == 600
-    assert config.permissions.deny == []
+    assert config.permission_ask_timeout == 600
 
 
 GEO = """

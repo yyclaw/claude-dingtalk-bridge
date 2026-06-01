@@ -20,7 +20,6 @@ from claude_dingtalk_bridge.claude_runner import (
 from claude_dingtalk_bridge.commands import CommandType, parse_command
 from claude_dingtalk_bridge.config import Config
 from claude_dingtalk_bridge.geo import GeoCheck
-from claude_dingtalk_bridge.permission_hooks import tripwire_match
 from claude_dingtalk_bridge import log_context
 from claude_dingtalk_bridge.projects import ProjectRegistry
 from claude_dingtalk_bridge.questions import (
@@ -922,11 +921,6 @@ class Orchestrator:
             # Wrap the summary in a fenced code block so a heredoc body with
             # a `# …` Python/shell comment line doesn't get rendered as an H1.
             body = f"{tool_name}:\n```\n{summary}\n```" if summary else tool_name
-            # A tripwire-matched Bash command (rm -f, dd of=/dev/*, …) gets a
-            # louder icon than the routine lock so it's unmistakable on the phone.
-            icon = "🔐"
-            if tool_name == "Bash" and tripwire_match(tool_input.get("command") or ""):
-                icon = "‼️"
             loop = asyncio.get_running_loop()
             self._permission_future = loop.create_future()
             chip = f"{tool_name}#{secrets.token_hex(4)}"
@@ -935,13 +929,13 @@ class Orchestrator:
                 chip, input_preview,
             )
             await self._send_markdown(
-                f'### {icon} Permission needed\n\n{body}\n###### 　\n\nReply `👌(ok)` to allow, `❌(no)` to deny.'
+                f'### 🔐 Permission needed\n\n{body}\n###### 　\n\nReply `👌(ok)` to allow, `❌(no)` to deny.'
             )
             start = loop.time()
             try:
                 allowed = await asyncio.wait_for(
                     self._permission_future,
-                    timeout=self._config.permission_timeout_seconds,
+                    timeout=self._config.permission_ask_timeout,
                 )
                 logger.info(
                     "permission reply tool=%s waited=%.1fs result=%s",
@@ -1016,7 +1010,7 @@ class Orchestrator:
             try:
                 reply = await asyncio.wait_for(
                     self._question_future,
-                    timeout=self._config.permission_timeout_seconds,
+                    timeout=self._config.permission_ask_timeout,
                 )
             except asyncio.TimeoutError:
                 await self._send("⏱ Question timed out — no answer recorded.")

@@ -39,7 +39,3 @@ make logs-web
 ### On the phone
 
 Chat 1:1 with the robot you created and send `/help` to see all supported commands.
-
-## Security design
-
-See the comments in `config.example.yaml`.

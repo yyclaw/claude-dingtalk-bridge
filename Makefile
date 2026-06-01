@@ -66,6 +66,9 @@ config: ## Create the config file from the template (if absent)
 test: ## Run the unit tests with a branch-coverage summary
 	$(PYTEST) -q --cov
 
+check: ## Smoke-check the Bash permission hook against a table of representative commands
+	$(PY) scripts/check_bash_permissions.py
+
 start: ## Run the daemon in the foreground (logs to terminal, Ctrl+C to quit)
 	@# Refuse to start a foreground instance while the launchd one is running --
 	@# both would race for the same DingTalk Stream connection.
@@ -112,6 +115,6 @@ logs-tail: ## Tail the daemon logs in the terminal (Ctrl+C to quit)
 logs-web: ## Open the daemon log live-viewer in a browser (defaults to today)
 	$(PY) scripts/log_server.py $(ARGS)
 
-.PHONY: help setup config test start \
+.PHONY: help setup config test check start \
 	daemon-install daemon-start daemon-stop daemon-restart \
 	daemon-status daemon-uninstall logs-tail logs-web
