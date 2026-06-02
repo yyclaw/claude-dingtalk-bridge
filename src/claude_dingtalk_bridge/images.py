@@ -78,7 +78,7 @@ def _prune_old_images() -> None:
 
 
 def download_image(download_url: str) -> Path:
-    """Fetch an image into the bridge's cache directory and return its path.
+    """Fetch an image into the daemon's cache directory and return its path.
 
     The extension is inferred from the response Content-Type, defaulting to
     `.png`. The body is streamed and capped at `_MAX_IMAGE_BYTES`; a download

@@ -11,6 +11,7 @@ from claude_agent_sdk import (
 )
 
 from claude_dingtalk_bridge.display import (
+    MD_SPACER,
     format_relative_time,
     format_size,
     md_escape,
@@ -34,7 +35,7 @@ def format_session_list(infos, current_id: str | None) -> str:
     `time · branch · size`, mirroring the desktop TUI. The leading index
     is kept so the phone can reply with `/resume <n>`.
     """
-    blocks = [f"📋 **Recent sessions ({len(infos)})**"]
+    blocks = [f"📋 **Recent sessions ({len(infos)})**\n{MD_SPACER}"]
     for idx, info in enumerate(infos, start=1):
         summary = (info.summary or "(no summary)").replace("\n", " ").strip()
         if len(summary) > _SUMMARY_LIMIT:
@@ -47,6 +48,7 @@ def format_session_list(infos, current_id: str | None) -> str:
         if info.session_id == current_id:
             meta.append("⭐ current")
         blocks.append(f"**{idx}. {summary}**  \n{' · '.join(meta)}")
+    blocks.append(MD_SPACER)
     blocks.append("💬 `/resume <n>` to switch")
     return "\n\n".join(blocks)
 

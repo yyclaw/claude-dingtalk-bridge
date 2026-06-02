@@ -17,10 +17,15 @@ from claude_dingtalk_bridge.claude_runner import (
     _model_cache_breakdown,
     tool_summary,
 )
-from claude_dingtalk_bridge.commands import CommandType, parse_command
+from claude_dingtalk_bridge.commands import (
+    HELP,
+    HELP_GROUPS,
+    CommandType,
+    parse_command,
+)
 from claude_dingtalk_bridge.config import Config
 from claude_dingtalk_bridge.geo import GeoCheck
-from claude_dingtalk_bridge import log_context
+from claude_dingtalk_bridge import log_context, self_update
 from claude_dingtalk_bridge.projects import ProjectRegistry
 from claude_dingtalk_bridge.questions import (
     format_question,
@@ -29,6 +34,7 @@ from claude_dingtalk_bridge.questions import (
     question_preview,
 )
 from claude_dingtalk_bridge.display import (
+    MD_SPACER,
     collapse_inline_paths,
     display_path,
     format_cost,
@@ -179,6 +185,13 @@ class Orchestrator:
         self._permission_future: asyncio.Future[bool] | None = None
         self._permission_lock = asyncio.Lock()
         self._question_future: asyncio.Future[str | None] | None = None
+        # Set while /update waits for a restart confirmation; a bare ok/no
+        # resolves it (see _cmd_permission_reply). Released on any new turn,
+        # /stop, /clear, or shutdown so a later ok/no can't be mistaken for it.
+        self._restart_confirm: asyncio.Future[bool] | None = None
+        # Guards _cmd_update against re-entry: set synchronously at entry so two
+        # concurrent /update messages can't both pull/make at once.
+        self._updating = False
         self._geo_check = geo_check
         self._dry_run = False
         self._resume_candidates: list[str] = []
@@ -224,6 +237,7 @@ class Orchestrator:
             self._permission_future.set_result(False)
         if self._question_future is not None and not self._question_future.done():
             self._question_future.set_result(None)
+        self._release_restart_confirm()
         # Cancel the running turn (also stops the Claude SDK child via
         # interrupt) and wait for unwind so the SDK subprocess gets a chance
         # to disconnect cleanly before the event loop dies.
@@ -249,7 +263,7 @@ class Orchestrator:
             self._question_future.set_result(text.strip())
             return
         if cmd.type is CommandType.STOP:
-            await self._cmd_stop()
+            await self._cmd_stop(cmd.arg)
         elif cmd.type is CommandType.APPROVE:
             await self._cmd_permission_reply(True)
         elif cmd.type is CommandType.DENY:
@@ -268,8 +282,12 @@ class Orchestrator:
             await self._cmd_pwd()
         elif cmd.type is CommandType.CLEAR:
             await self._cmd_clear()
+        elif cmd.type is CommandType.QUEUE:
+            await self._cmd_queue(cmd.arg)
+        elif cmd.type is CommandType.UPDATE:
+            await self._cmd_update()
         elif cmd.type is CommandType.HELP:
-            await self._cmd_help()
+            await self._cmd_help(cmd.arg)
         elif cmd.type is CommandType.SESSION:
             await self._cmd_session()
         elif cmd.type is CommandType.RESUME:
@@ -331,12 +349,21 @@ class Orchestrator:
         self._task.cancel()
         return True
 
-    async def _cmd_stop(self) -> None:
+    async def _cmd_stop(self, arg: str | None = None) -> None:
+        stop_all = arg is not None and arg.strip().lower() == "all"
+        # Clear the queue BEFORE aborting: the cancelled turn's finally runs
+        # _drain_queue, which would otherwise pop the next prompt and start it
+        # — exactly the auto-advance `/stop all` is meant to prevent.
+        dropped = 0
+        if stop_all:
+            dropped = len(self._queue)
+            self._queue.clear()
         if self._permission_future is not None and not self._permission_future.done():
             self._permission_future.set_result(False)
             await self._send("🚫 Denied the pending operation.")
         if self._question_future is not None and not self._question_future.done():
             self._question_future.set_result(None)
+        self._release_restart_confirm()
         task = self._task
         if task is not None and not task.done():
             # Without this line a /stop'd turn looks identical to a hang in
@@ -356,15 +383,43 @@ class Orchestrator:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             if self._task is None:
-                await self._send(
-                    "✅ Task stopped.\n"
-                    "The session is kept — send a new prompt anytime.\n"
-                    'Or say "go on" to continue where it left off.'
-                )
+                if stop_all:
+                    queue_note = (
+                        f"\nDropped {dropped} queued prompt(s)." if dropped else ""
+                    )
+                    await self._send(
+                        "✅ Task stopped and queue cleared."
+                        f"{queue_note}\n"
+                        "The session is kept — send a new prompt anytime."
+                    )
+                else:
+                    await self._send(
+                        "✅ Task stopped.\n"
+                        "The session is kept — send a new prompt anytime.\n"
+                        'Or say "go on" to continue where it left off.'
+                    )
+        elif stop_all and dropped:
+            await self._send(f"🧹 Cleared {dropped} queued prompt(s).")
         else:
             await self._send("ℹ️ No task is running.")
 
+    def _release_restart_confirm(self) -> None:
+        """Resolve a pending /update restart confirmation as 'skip'.
+
+        /stop, /clear, and shutdown all mean the user abandoned the update;
+        resolve the future as skip so it isn't left dangling (and can't later
+        be mistaken for restart approval by _cmd_permission_reply)."""
+        if self._restart_confirm is not None and not self._restart_confirm.done():
+            self._restart_confirm.set_result(False)
+
     async def _cmd_permission_reply(self, approved: bool) -> None:
+        # A pending /update restart confirmation takes priority. It exists only
+        # while _updating is set, during which no turn can start (see
+        # _cmd_prompt), so no tool-permission reply is ever in flight here — an
+        # ok/no unambiguously answers the restart prompt.
+        if self._restart_confirm is not None and not self._restart_confirm.done():
+            self._restart_confirm.set_result(approved)
+            return
         if self._permission_future is not None and not self._permission_future.done():
             self._permission_future.set_result(approved)
         else:
@@ -532,6 +587,7 @@ class Orchestrator:
         await self._send_markdown("\n".join(lines))
 
     async def _cmd_clear(self) -> None:
+        self._release_restart_confirm()
         await self._abort_running_task()
         self._queue.clear()
         self._runner.reset(self._current_project.path)
@@ -540,29 +596,169 @@ class Orchestrator:
             "💬 The next message starts a fresh conversation."
         )
 
-    async def _cmd_help(self) -> None:
-        await self._send_markdown(
-            "🛠 **Commands**\n\n"
-            "**Task**\n\n"
-            "- `/stop` — Interrupt current task\n"
-            "- `/clear` — Interrupt & reset current session\n\n"
-            "**Project**\n\n"
-            "- `/pwd` — Show current working directory\n"
-            "- `/ls` — List projects\n"
-            "- `/cd <name>` — Switch working directory\n\n"
-            "**Session**\n\n"
-            "- `/session` — Show current session id\n"
-            "- `/resume [id]` — List or switch session\n"
-            "- `/compact` — Compact current conversation history\n\n"
-            "**Info**\n\n"
-            "- `/status` — Show runtime status and token usage\n"
-            "- `/context` — Show context window usage\n\n"
-            "**Modes**\n\n"
-            "- `/model [name]` — List or switch model\n"
-            "- `/mode [name]` — List or switch permission mode\n"
-            "- `/verbose on|off` — Stream every step\n"
-            "- `/debug on|off` — Skip Claude Code, debug the daemon only"
-        )
+    async def _cmd_queue(self, arg: str | None) -> None:
+        # split() collapses any run of interior whitespace, so "rm   3" and
+        # "rm  all" parse the same as their single-space forms.
+        parts = (arg or "").split()
+        if not parts:
+            await self._send_markdown(self._render_queue())
+            return
+        verb = parts[0].lower()
+        rest = [p.lower() for p in parts[1:]]
+        if verb == "clear" or (verb == "rm" and rest == ["all"]):
+            if not self._queue:
+                await self._send("📭 Queue is already empty.")
+                return
+            dropped = len(self._queue)
+            self._queue.clear()
+            await self._send(f"🗑 Cleared {dropped} queued prompt(s).")
+            return
+        if verb == "rm" and len(rest) == 1 and rest[0].isdigit():
+            n = int(rest[0])
+            if n < 1 or n > len(self._queue):
+                await self._send(
+                    f"⚠️ No queued prompt #{n} — "
+                    f"the queue has {len(self._queue)}."
+                )
+                return
+            removed = self._queue.pop(n - 1)
+            await self._send(f"🗑 Removed #{n} from queue: {_summary(removed)}")
+            return
+        await self._send_markdown("⚠️ Usage:\n" + HELP["queue"].detail)
+
+    def _render_queue(self) -> str:
+        if not self._queue:
+            return "📭 Queue is empty."
+        lines = [f"📋 **Queue** · {len(self._queue)} waiting", MD_SPACER]
+        for i, prompt in enumerate(self._queue, start=1):
+            lines.append(f"{i}. {md_escape(_summary(prompt))}")
+        lines.append(MD_SPACER)
+        lines.append("💬 `/queue rm N` to drop one · `/queue clear` to empty")
+        return "\n".join(lines)
+
+    async def _cmd_update(self) -> None:
+        """Update the daemon program itself: pull, re-setup/config on change,
+        then confirm before restarting.
+
+        Operates on the daemon's own repo (see self_update), unrelated to the
+        user's projects. Refuses while a turn runs — like /cd and /resume —
+        because the restart confirmation reuses the ok/no reply path. The
+        _updating guard (set synchronously, no await before it) stops a second
+        /update from racing the first into a concurrent pull/make.
+        """
+        if self._task is not None and not self._task.done():
+            await self._send(
+                "⚠️ A task is running. Send /stop first, then /update."
+            )
+            return
+        if self._updating:
+            await self._send("⚠️ An update is already in progress.")
+            return
+        self._updating = True
+        try:
+            await self._do_update()
+        finally:
+            self._updating = False
+
+    async def _do_update(self) -> None:
+        await self._send("🔄 Checking for updates…")
+        try:
+            status = await self_update.fetch_and_compare()
+        except self_update.SelfUpdateError as exc:
+            await self._send(f"⚠️ Update check failed\n{exc}")
+            return
+        if not status.behind:
+            await self._send("✅ Already up to date.")
+            return
+
+        try:
+            before = self_update.snapshot()
+        except self_update.SelfUpdateError as exc:
+            await self._send(f"⚠️ Update aborted\n{exc}")
+            return
+        subjects = "\n".join(status.subjects)
+        await self._send(f"⬇️ Pulling {status.behind} commit(s):\n{subjects}")
+        try:
+            await self_update.pull()
+        except self_update.SelfUpdateError as exc:
+            await self._send(f"⚠️ git pull failed\n{exc}")
+            return
+        try:
+            after = self_update.snapshot()
+        except self_update.SelfUpdateError as exc:
+            await self._send(
+                f"⚠️ Pulled, but checking deps/config failed\n{exc}\n"
+                "Run make daemon-restart when ready."
+            )
+            return
+
+        if before.pyproject != after.pyproject:
+            await self._send("📦 Dependencies changed — running make setup…")
+            try:
+                await self_update.run_make("setup")
+            except self_update.SelfUpdateError as exc:
+                await self._send(f"⚠️ make setup failed\n{exc}")
+                return
+            await self._send("✅ Dependencies installed.")
+        if before.config_template != after.config_template:
+            try:
+                out = await self_update.run_make("config")
+            except self_update.SelfUpdateError as exc:
+                await self._send(f"⚠️ make config failed\n{exc}")
+                return
+            await self._send(f"⚙️ Config template changed:\n{out.strip()}")
+
+        # Code changed, so a restart is needed regardless of deps/config —
+        # confirm before the disruptive kickstart.
+        loop = asyncio.get_running_loop()
+        self._restart_confirm = loop.create_future()
+        await self._send("✅ Update pulled. Reply ok to restart now, no to skip.")
+        try:
+            ok = await asyncio.wait_for(
+                self._restart_confirm,
+                timeout=self._config.permission_ask_timeout,
+            )
+        except asyncio.TimeoutError:
+            await self._send(
+                "⏱ Restart not confirmed — run make daemon-restart when ready."
+            )
+            return
+        finally:
+            self._restart_confirm = None
+        if not ok:
+            await self._send(
+                "👍 Restart skipped — the new code loads on the next restart."
+            )
+            return
+        await self._send("♻️ Restarting now — back in a few seconds.")
+        self_update.trigger_restart_detached()
+
+    async def _cmd_help(self, arg: str | None = None) -> None:
+        name = (arg or "").strip().lstrip("/").lower()
+        if name:
+            entry = HELP.get(name)
+            if entry is None:
+                await self._send(
+                    f"⚠️ Unknown command `{name}`. Send `/help` for the list."
+                )
+                return
+            # Detail is the full explanation; the one-line brief is only the
+            # fallback for commands too simple to warrant a detail block.
+            content = entry.detail or f"{entry.brief}."
+            await self._send_markdown(f"🛠 `{entry.syntax}`\n\n{content.strip()}")
+            return
+        lines = ["🛠 **Commands**", ""]
+        for group in HELP_GROUPS:
+            members = [e for e in HELP.values() if e.group == group]
+            if not members:  # pragma: no cover - guards a future empty group
+                continue
+            lines.append(MD_SPACER)
+            lines.append(f"**{group}**\n")
+            for entry in members:
+                lines.append(f"- `{entry.syntax}` — {entry.brief}")
+        lines.append(MD_SPACER)
+        lines.append("💬 `/help <command>` for one command's full usage")
+        await self._send_markdown("\n".join(lines))
 
     async def _cmd_session(self) -> None:
         project = self._current_project
@@ -574,13 +770,14 @@ class Orchestrator:
             )
             return
         transcript = session_transcript_path(project.path, session_id)
-        await self._send_markdown(
-            f"🧵 **Current session** · {md_escape(project.name)}\n\n"
-            f"**Session ID:**\n"
-            f"```\n{session_id}\n```\n\n"
-            f"**Transcript:**\n"
-            f"```\n{display_path(transcript)}\n```"
-        )
+        lines = [f"🧵 **Current session** · {md_escape(project.name)}"]
+        lines.append(f"{MD_SPACER}")
+        lines.append(f"**Session ID:**")
+        lines.append(f"```\n{session_id}\n```")
+        lines.append(f"{MD_SPACER}")
+        lines.append(f"**Transcript:**")
+        lines.append(f"```\n{display_path(transcript)}\n```")
+        await self._send_markdown("\n".join(lines))
 
     async def _cmd_resume(self, arg: str | None) -> None:
         if self._task is not None and not self._task.done():
@@ -633,7 +830,7 @@ class Orchestrator:
                 )
                 return None
             return self._resume_candidates[idx - 1]
-        await self._send('ℹ️ Usage: `/resume`, `/resume <number>`, or `/resume <session-id>`.')
+        await self._send_markdown("ℹ️ Usage:\n" + HELP["resume"].detail)
         return None
 
     def _format_model_list(self) -> str:
@@ -643,7 +840,7 @@ class Orchestrator:
         for name in MODEL_NAMES:
             mark = " *(current)*" if override == name else ""
             lines.append(f"- {name} {mark}")
-        lines.append("")
+        lines.append(MD_SPACER)
         # A list-external override (a full model id) gets its own line since
         # no list entry would be marked; otherwise show the observed default.
         # Model ids go in a code span — escaping would render as HTML entities.
@@ -655,9 +852,8 @@ class Orchestrator:
                 lines.append(f"Current: `{observed}`")
             else:
                 lines.append("Current: SDK default — send a prompt to detect it.")
-        lines.append("")
-        lines.append('💬 `/model <name>` to switch')
-        lines.append("")
+        lines.append(MD_SPACER)
+        lines.append('💬 `/model <name>` to switch\n')
         lines.append('🎏 Example: /model claude-opus-4-8[1m]')
         return "\n".join(lines)
 
@@ -679,7 +875,7 @@ class Orchestrator:
                 mark = " (current)" if name == current else ""
                 lines.append(f"- `{name}`{mark}")
             lines.append("- `reset` — fall back to TUI's settings")
-            lines.append("")
+            lines.append(MD_SPACER)
             lines.append('💬 `/mode <name>` to switch')
             await self._send_markdown("\n".join(lines))
             return
@@ -706,6 +902,14 @@ class Orchestrator:
 
     async def _cmd_prompt(self, prompt: str) -> None:
         if not prompt:
+            return
+        # No new turn may start mid-update: the restart that ends /update would
+        # wipe the session anyway, and a running turn would let its ok/no be
+        # mistaken for the restart confirmation. Refuse rather than queue.
+        if self._updating:
+            await self._send(
+                "⚙️ Updating the daemon — please resend your message once it finishes."
+            )
             return
         if self._task is not None and not self._task.done():
             # If the runner is just waiting for a missing background-agent
@@ -929,7 +1133,7 @@ class Orchestrator:
                 chip, input_preview,
             )
             await self._send_markdown(
-                f'### 🔐 Permission needed\n\n{body}\n###### 　\n\nReply `👌(ok)` to allow, `❌(no)` to deny.'
+                f'### 🔐 Permission needed\n{MD_SPACER}\n{body}\n{MD_SPACER}\n\nReply `👌(ok)` to allow, `❌(no)` to deny.'
             )
             start = loop.time()
             try:

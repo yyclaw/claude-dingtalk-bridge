@@ -2090,3 +2090,608 @@ async def test_delayed_pending_notice_recheck_finds_nothing_after_sleep(monkeypa
     orchestrator._acknowledged_tasks.add("t1")
     await orchestrator._delayed_pending_notice()
     assert not any("background agent" in m for m in sent)
+
+
+# --- /stop all & queue management -------------------------------------------
+
+
+def _blocking_runner(block_prompt="first"):
+    """A FakeRunner whose run_turn records turns (like the real one) but hangs
+    on `block_prompt` until its gate is set — so a turn stays in-flight while
+    the test queues more prompts and issues /stop."""
+    gate = asyncio.Event()
+    runner = FakeRunner()
+
+    async def blocking_run_turn(project_path, prompt, emit):
+        runner.turns.append((project_path, prompt))
+        if prompt == block_prompt:
+            await gate.wait()
+        else:
+            await emit(ResultEvent("", False))
+
+    runner.run_turn = blocking_run_turn
+    return runner, gate
+
+
+async def _spin(n=5):
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+async def test_stop_all_clears_queue_without_resetting_session():
+    runner, gate = _blocking_runner()
+    orchestrator, runner, sent = build(runner)
+    await orchestrator.handle_message("first", AUTHORIZED)
+    await _spin()
+    orchestrator._queue = ["queued one", "queued two"]
+    await orchestrator.handle_message("/stop all", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert runner.interrupts == 1
+    assert orchestrator._queue == []
+    assert runner.resets == []  # session kept, unlike /clear
+    assert any("queue" in m.lower() for m in sent)
+
+
+async def test_stop_all_prevents_auto_advance_to_queued_prompt():
+    # The whole point of /stop all: the queued prompt must NOT auto-start the
+    # way it does after a bare /stop. Clearing the queue before the abort is
+    # what stops _run's finally from popping it.
+    runner, gate = _blocking_runner()
+    orchestrator, runner, sent = build(runner)
+    await orchestrator.handle_message("first", AUTHORIZED)
+    await _spin()
+    await orchestrator.handle_message("second", AUTHORIZED)
+    assert orchestrator._queue == ["second"]
+    await orchestrator.handle_message("/stop all", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert orchestrator._queue == []
+    assert runner.turns == [("/tmp/multica", "first")]  # "second" never ran
+
+
+async def test_stop_all_when_idle_clears_queue():
+    # No turn running, but prompts are queued (e.g. left over). /stop all
+    # should still drop them and say so.
+    orchestrator, runner, sent = build()
+    orchestrator._queue = ["one", "two"]
+    await orchestrator.handle_message("/stop all", AUTHORIZED)
+    assert orchestrator._queue == []
+    assert any("Cleared" in m and "2" in m for m in sent)
+
+
+async def test_bare_stop_still_auto_advances_queue():
+    # Regression guard: /stop (no arg) keeps the existing behaviour — the next
+    # queued prompt takes over.
+    runner, gate = _blocking_runner()
+    orchestrator, runner, sent = build(runner)
+    await orchestrator.handle_message("first", AUTHORIZED)
+    await _spin()
+    await orchestrator.handle_message("second", AUTHORIZED)
+    await orchestrator.handle_message("/stop", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert ("/tmp/multica", "second") in runner.turns
+
+
+async def test_queue_view_lists_numbered_prompts():
+    orchestrator, runner, sent = build()
+    orchestrator._queue = ["alpha task", "beta task"]
+    await orchestrator.handle_message("/queue", AUTHORIZED)
+    text = "\n".join(sent)
+    assert "1" in text and "alpha task" in text
+    assert "2" in text and "beta task" in text
+
+
+async def test_queue_view_empty():
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/queue", AUTHORIZED)
+    assert any("empty" in m.lower() for m in sent)
+
+
+async def test_queue_rm_removes_nth_prompt():
+    orchestrator, runner, sent = build()
+    orchestrator._queue = ["one", "two", "three"]
+    await orchestrator.handle_message("/queue rm 2", AUTHORIZED)
+    assert orchestrator._queue == ["one", "three"]
+    assert any("two" in m for m in sent)
+
+
+async def test_queue_rm_out_of_range_reports_error():
+    orchestrator, runner, sent = build()
+    orchestrator._queue = ["only"]
+    await orchestrator.handle_message("/queue rm 5", AUTHORIZED)
+    assert orchestrator._queue == ["only"]  # unchanged
+    assert any("5" in m and "1" in m for m in sent)
+
+
+async def test_queue_rm_non_number_reports_usage():
+    orchestrator, runner, sent = build()
+    orchestrator._queue = ["only"]
+    await orchestrator.handle_message("/queue rm abc", AUTHORIZED)
+    assert orchestrator._queue == ["only"]
+    assert any("/queue" in m for m in sent)
+
+
+async def test_queue_rm_all_clears():
+    orchestrator, runner, sent = build()
+    orchestrator._queue = ["one", "two"]
+    await orchestrator.handle_message("/queue rm all", AUTHORIZED)
+    assert orchestrator._queue == []
+    assert any("2" in m for m in sent)
+
+
+async def test_queue_rm_tolerates_extra_interior_whitespace():
+    orchestrator, runner, sent = build()
+    orchestrator._queue = ["one", "two", "three"]
+    await orchestrator.handle_message("/queue rm   2", AUTHORIZED)
+    assert orchestrator._queue == ["one", "three"]
+
+
+async def test_queue_rm_all_tolerates_extra_interior_whitespace():
+    orchestrator, runner, sent = build()
+    orchestrator._queue = ["one", "two"]
+    await orchestrator.handle_message("/queue  rm   all", AUTHORIZED)
+    assert orchestrator._queue == []
+
+
+async def test_queue_clear_clears():
+    orchestrator, runner, sent = build()
+    orchestrator._queue = ["one", "two", "three"]
+    await orchestrator.handle_message("/queue clear", AUTHORIZED)
+    assert orchestrator._queue == []
+
+
+async def test_queue_clear_when_empty():
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/queue clear", AUTHORIZED)
+    assert any("empty" in m.lower() for m in sent)
+
+
+async def test_queue_unknown_subcommand_shows_usage():
+    orchestrator, runner, sent = build()
+    orchestrator._queue = ["one"]
+    await orchestrator.handle_message("/queue frobnicate", AUTHORIZED)
+    assert orchestrator._queue == ["one"]
+    assert any("/queue" in m for m in sent)
+
+
+# --- /help <command> --------------------------------------------------------
+
+
+async def test_help_lists_each_command_once():
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/help", AUTHORIZED)
+    # The trailing "/help <command>" footer is a usage hint, not a list entry;
+    # check the command list above it.
+    body = "\n".join(sent).split("💬")[0]
+    for name in ("/stop", "/clear", "/queue", "/debug", "/model"):
+        assert body.count(name) == 1, f"{name} should appear exactly once"
+
+
+async def test_help_list_omits_self_referential_help_entry():
+    # /help itself isn't a list row — the footer already explains it, so the
+    # only "/help" in the output is that trailing hint.
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/help", AUTHORIZED)
+    text = "\n".join(sent)
+    assert text.count("/help") == 1
+    assert "/help <command>" in text  # the footer hint survives
+
+
+async def test_help_detail_shows_command_usage():
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/help queue", AUTHORIZED)
+    text = "\n".join(sent)
+    assert "rm" in text and "clear" in text
+
+
+async def test_help_detail_accepts_leading_slash():
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/help /resume", AUTHORIZED)
+    assert any("session" in m.lower() for m in sent)
+
+
+async def test_help_unknown_command_points_to_help():
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/help nope", AUTHORIZED)
+    assert any("/help" in m for m in sent)
+
+
+async def test_help_detail_for_command_without_extra_detail():
+    # /pwd has only a one-line brief, no detail block — brief is the fallback.
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/help pwd", AUTHORIZED)
+    assert any("/pwd" in m and "working directory" in m for m in sent)
+
+
+async def test_help_detail_prefers_detail_over_brief():
+    # When a command has a detail block, the detail page shows it instead of
+    # the one-line brief (brief is only the fallback). Syntax stays.
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("/help cd", AUTHORIZED)
+    text = "\n".join(sent)
+    assert "/cd <name>" in text          # syntax line
+    assert "resets its session" in text  # detail
+    assert "Switch working directory" not in text  # brief suppressed
+
+
+# --- /update (self-update) ---------------------------------------------
+
+import claude_dingtalk_bridge.self_update as su  # noqa: E402
+
+
+def _compare(behind, subjects=()):
+    return su.CompareResult(behind=behind, subjects=list(subjects))
+
+
+def _patch_self_update(
+    monkeypatch,
+    *,
+    compare=None,
+    snapshots=None,
+    pull_raises=None,
+    make_raises=None,
+):
+    """Wire the self_update module the orchestrator calls into deterministic
+    fakes, recording what ran. Returns a dict of recorded calls."""
+    rec = {"pull": 0, "make": [], "restart": 0}
+
+    async def fake_fetch(*_a, **_k):
+        if isinstance(compare, Exception):
+            raise compare
+        return compare
+
+    monkeypatch.setattr(su, "fetch_and_compare", fake_fetch)
+
+    if snapshots is not None:
+        it = iter(snapshots)
+        monkeypatch.setattr(su, "snapshot", lambda *_a, **_k: next(it))
+
+    async def fake_pull(*_a, **_k):
+        if pull_raises:
+            raise pull_raises
+        rec["pull"] += 1
+
+    monkeypatch.setattr(su, "pull", fake_pull)
+
+    async def fake_make(target, *_a, **_k):
+        rec["make"].append(target)
+        if make_raises:
+            raise make_raises
+        return f"<output of make {target}>"
+
+    monkeypatch.setattr(su, "run_make", fake_make)
+    monkeypatch.setattr(
+        su, "trigger_restart_detached",
+        lambda *_a, **_k: rec.__setitem__("restart", rec["restart"] + 1),
+    )
+    return rec
+
+
+async def _drive_to_confirm(orchestrator):
+    """Run /update in a task and wait until it's awaiting restart confirmation."""
+    task = asyncio.create_task(orchestrator.handle_message("/update", AUTHORIZED))
+    while orchestrator._restart_confirm is None:
+        await asyncio.sleep(0)
+    return task
+
+
+async def test_update_refuses_while_task_running(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(monkeypatch, compare=_compare(3))
+    orchestrator._task = asyncio.create_task(asyncio.sleep(100))
+    await orchestrator.handle_message("/update", AUTHORIZED)
+    assert any("task is running" in m.lower() for m in sent)
+    assert rec["pull"] == 0  # never even fetched/pulled
+    orchestrator._task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await orchestrator._task
+
+
+async def test_update_reports_already_up_to_date(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(monkeypatch, compare=_compare(0))
+    await orchestrator.handle_message("/update", AUTHORIZED)
+    assert any("up to date" in m.lower() for m in sent)
+    assert rec["pull"] == 0
+
+
+async def test_update_surfaces_check_failure(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch, compare=su.SelfUpdateError("git fetch failed:\nboom")
+    )
+    await orchestrator.handle_message("/update", AUTHORIZED)
+    assert any("boom" in m for m in sent)
+    assert rec["pull"] == 0
+
+
+async def test_update_full_flow_runs_setup_config_and_restarts_on_ok(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(2, ["abc fix login", "def add feature"]),
+        snapshots=[
+            su.Snapshot(b"deps-v1", b"cfg-v1"),
+            su.Snapshot(b"deps-v2", b"cfg-v2"),  # both changed
+        ],
+    )
+    task = await _drive_to_confirm(orchestrator)
+    await orchestrator.handle_message("ok", AUTHORIZED)
+    await task
+    assert rec["pull"] == 1
+    assert rec["make"] == ["setup", "config"]
+    assert rec["restart"] == 1
+    text = "\n".join(sent)
+    assert "abc fix login" in text                 # pull preview
+    assert "<output of make config>" in text        # config output forwarded
+    assert any("Restarting now" in m for m in sent)
+
+
+async def test_update_skips_restart_on_no(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc fix"]),
+        snapshots=[su.Snapshot(b"d", b"c"), su.Snapshot(b"d", b"c")],  # unchanged
+    )
+    task = await _drive_to_confirm(orchestrator)
+    await orchestrator.handle_message("no", AUTHORIZED)
+    await task
+    assert rec["pull"] == 1
+    assert rec["make"] == []           # nothing changed → no setup/config
+    assert rec["restart"] == 0
+    assert any("skipped" in m.lower() for m in sent)
+
+
+async def test_update_runs_setup_only_when_deps_change(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d1", b"c"), su.Snapshot(b"d2", b"c")],  # deps only
+    )
+    task = await _drive_to_confirm(orchestrator)
+    await orchestrator.handle_message("ok", AUTHORIZED)
+    await task
+    assert rec["make"] == ["setup"]
+
+
+async def test_update_aborts_on_pull_failure(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d", b"c")],  # only the pre-pull snapshot is read
+        pull_raises=su.SelfUpdateError("git pull failed:\nNot possible to fast-forward"),
+    )
+    await orchestrator.handle_message("/update", AUTHORIZED)
+    assert any("fast-forward" in m for m in sent)
+    assert rec["make"] == [] and rec["restart"] == 0
+    assert orchestrator._restart_confirm is None  # never reached the confirm step
+
+
+async def test_update_aborts_on_setup_failure(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d1", b"c"), su.Snapshot(b"d2", b"c")],
+        make_raises=su.SelfUpdateError("make setup failed:\nError 1"),
+    )
+    await orchestrator.handle_message("/update", AUTHORIZED)
+    assert any("Error 1" in m for m in sent)
+    assert rec["restart"] == 0
+    assert orchestrator._restart_confirm is None
+
+
+async def test_update_aborts_on_config_failure(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d", b"c1"), su.Snapshot(b"d", b"c2")],  # config only
+        make_raises=su.SelfUpdateError("make config failed:\nboom"),
+    )
+    await orchestrator.handle_message("/update", AUTHORIZED)
+    assert rec["make"] == ["config"]  # deps unchanged → setup skipped
+    assert any("boom" in m for m in sent)
+    assert rec["restart"] == 0
+    assert orchestrator._restart_confirm is None
+
+
+async def test_update_aborts_when_pre_pull_snapshot_fails(monkeypatch):
+    # snapshot() before the pull raises (e.g. config.example.yaml unreadable) —
+    # abort before touching git so nothing is half-applied.
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(monkeypatch, compare=_compare(1, ["abc"]))
+
+    def boom(*_a, **_k):
+        raise su.SelfUpdateError("reading update snapshot failed:\nno pyproject")
+
+    monkeypatch.setattr(su, "snapshot", boom)
+    await orchestrator.handle_message("/update", AUTHORIZED)
+    assert any("Update aborted" in m for m in sent)
+    assert rec["pull"] == 0  # never pulled
+    assert rec["make"] == [] and rec["restart"] == 0
+    assert orchestrator._restart_confirm is None
+
+
+async def test_update_surfaces_post_pull_snapshot_failure(monkeypatch):
+    # The pull succeeds but the after-snapshot fails (e.g. the pull renamed
+    # config.example.yaml) — report it and tell the user to restart manually
+    # rather than silently skipping setup/config.
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(monkeypatch, compare=_compare(1, ["abc"]))
+    calls = {"n": 0}
+
+    def snap(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return su.Snapshot(b"d", b"c")
+        raise su.SelfUpdateError("reading update snapshot failed:\nconfig renamed")
+
+    monkeypatch.setattr(su, "snapshot", snap)
+    await orchestrator.handle_message("/update", AUTHORIZED)
+    assert rec["pull"] == 1  # pulled, then the after-snapshot failed
+    assert any("checking deps/config failed" in m for m in sent)
+    assert any("make daemon-restart" in m for m in sent)
+    assert rec["make"] == [] and rec["restart"] == 0
+    assert orchestrator._restart_confirm is None
+
+
+async def test_update_restart_confirm_times_out(monkeypatch):
+    orchestrator, runner, sent = build()
+    orchestrator._config.permission_ask_timeout = 0.01
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d", b"c"), su.Snapshot(b"d", b"c")],
+    )
+    await orchestrator.handle_message("/update", AUTHORIZED)  # no reply → times out
+    assert any("not confirmed" in m.lower() for m in sent)
+    assert rec["restart"] == 0
+    assert orchestrator._restart_confirm is None
+
+
+async def test_plain_ok_without_pending_restart_or_permission(monkeypatch):
+    # The restart-confirm path must not swallow a bare ok when nothing is
+    # pending — it still falls through to the "no pending operation" reply.
+    orchestrator, runner, sent = build()
+    await orchestrator.handle_message("ok", AUTHORIZED)
+    assert any("no pending operation" in m.lower() for m in sent)
+
+
+async def test_update_restart_confirm_released_by_stop(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d", b"c"), su.Snapshot(b"d", b"c")],
+    )
+    task = await _drive_to_confirm(orchestrator)
+    await orchestrator.handle_message("/stop", AUTHORIZED)
+    await task
+    assert rec["restart"] == 0
+    assert orchestrator._restart_confirm is None
+    assert any("skipped" in m.lower() for m in sent)
+
+
+async def test_update_restart_confirm_released_by_clear(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d", b"c"), su.Snapshot(b"d", b"c")],
+    )
+    task = await _drive_to_confirm(orchestrator)
+    await orchestrator.handle_message("/clear", AUTHORIZED)
+    await task
+    assert rec["restart"] == 0
+    assert orchestrator._restart_confirm is None
+
+
+async def test_prompt_during_update_is_refused_so_confirm_is_never_stolen(monkeypatch):
+    # The core fix: while /update is in flight no new turn may start — a prompt
+    # is refused with a notice. So no tool-permission reply is ever in flight to
+    # collide with the restart confirm, and a later ok unambiguously restarts.
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d", b"c"), su.Snapshot(b"d", b"c")],
+    )
+    task = await _drive_to_confirm(orchestrator)
+    sent.clear()
+    await orchestrator.handle_message("do other work", AUTHORIZED)
+    assert any("updating" in m.lower() for m in sent)  # refused, not started
+    assert runner.turns == []  # no turn started mid-update
+    assert orchestrator._restart_confirm is not None  # confirm still pending
+    await orchestrator.handle_message("ok", AUTHORIZED)  # belongs to the confirm
+    await task
+    assert rec["restart"] == 1
+
+
+async def test_prompt_during_update_git_phase_is_refused(monkeypatch):
+    # The real race window: a prompt arriving while /update is still pulling —
+    # before the restart confirm even exists — must be refused, not started.
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d", b"c"), su.Snapshot(b"d", b"c")],
+    )
+    gate = asyncio.Event()
+
+    async def blocking_pull(*_a, **_k):
+        await gate.wait()
+        rec["pull"] += 1
+
+    monkeypatch.setattr(su, "pull", blocking_pull)
+    task = asyncio.create_task(orchestrator.handle_message("/update", AUTHORIZED))
+    while not any("Pulling" in m for m in sent):
+        await asyncio.sleep(0)
+    assert orchestrator._updating is True
+    assert orchestrator._restart_confirm is None  # confirm not created yet
+    await orchestrator.handle_message("do other work", AUTHORIZED)
+    assert any("updating" in m.lower() for m in sent)  # refused
+    assert runner.turns == []  # no turn started
+    gate.set()  # let the pull and the rest of the update proceed
+    while orchestrator._restart_confirm is None:
+        await asyncio.sleep(0)
+    await orchestrator.handle_message("no", AUTHORIZED)  # decline the restart
+    await task
+    assert rec["restart"] == 0
+
+
+async def test_voice_message_during_update_is_refused(monkeypatch):
+    # handle_audio funnels into _cmd_prompt, so a voice message mid-update is
+    # refused just like a typed one — no turn starts, the confirm stays pending.
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d", b"c"), su.Snapshot(b"d", b"c")],
+    )
+    task = await _drive_to_confirm(orchestrator)
+    sent.clear()
+    await orchestrator.handle_audio("run the tests", AUTHORIZED)
+    assert any("updating" in m.lower() for m in sent)
+    assert runner.turns == []
+    assert orchestrator._restart_confirm is not None
+    await orchestrator.handle_message("no", AUTHORIZED)
+    await task
+    assert rec["restart"] == 0
+
+
+async def test_image_message_during_update_is_refused(monkeypatch):
+    # handle_image likewise funnels into _cmd_prompt and is refused mid-update.
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d", b"c"), su.Snapshot(b"d", b"c")],
+    )
+    task = await _drive_to_confirm(orchestrator)
+    sent.clear()
+    await orchestrator.handle_image("describe [image]", AUTHORIZED)
+    assert any("updating" in m.lower() for m in sent)
+    assert runner.turns == []
+    await orchestrator.handle_message("no", AUTHORIZED)
+    await task
+    assert rec["restart"] == 0
+
+
+async def test_second_update_refused_while_confirm_pending(monkeypatch):
+    orchestrator, runner, sent = build()
+    rec = _patch_self_update(
+        monkeypatch,
+        compare=_compare(1, ["abc"]),
+        snapshots=[su.Snapshot(b"d", b"c"), su.Snapshot(b"d", b"c")],
+    )
+    task = await _drive_to_confirm(orchestrator)
+    sent.clear()
+    await orchestrator.handle_message("/update", AUTHORIZED)  # second, concurrent
+    assert any("already in progress" in m.lower() for m in sent)
+    assert rec["pull"] == 1  # the second never pulled again
+    await orchestrator.handle_message("no", AUTHORIZED)  # resolve the first
+    await task
+    assert rec["restart"] == 0

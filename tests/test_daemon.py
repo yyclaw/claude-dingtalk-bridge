@@ -68,6 +68,57 @@ async def test_build_orchestrator_markdown_sender_uses_markdown_template(monkeyp
     ]
 
 
+async def test_markdown_sender_splits_oversized_body(monkeypatch):
+    import claude_dingtalk_bridge.daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "_MARKDOWN_BYTE_BUDGET", 10)
+    orchestrator, transport = build_orchestrator(make_config())
+    calls: list = []
+    monkeypatch.setattr(
+        transport, "send_markdown",
+        lambda uid, title, text: calls.append(text),
+    )
+    await orchestrator._send_markdown("AAAA\n\nBBBB\n\nCCCC\n\nDDDD")
+    assert len(calls) > 1
+    assert all(len(t.encode("utf-8")) <= 10 for t in calls)
+
+
+async def test_markdown_sender_splits_by_line_budget(monkeypatch):
+    import claude_dingtalk_bridge.daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "_MARKDOWN_BYTE_BUDGET", 100_000)
+    monkeypatch.setattr(daemon_mod, "_MARKDOWN_LINE_BUDGET", 3)
+    orchestrator, transport = build_orchestrator(make_config())
+    calls: list = []
+    monkeypatch.setattr(
+        transport, "send_markdown",
+        lambda uid, title, text: calls.append(text),
+    )
+    await orchestrator._send_markdown("\n".join(f"L{n}" for n in range(9)))
+    assert len(calls) > 1
+    assert all(t.count("\n") + 1 <= 3 for t in calls)
+
+
+async def test_markdown_sender_pads_long_code_chunk_tail(monkeypatch):
+    import claude_dingtalk_bridge.daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "_CODE_TAIL_MIN_LINES", 35)
+    monkeypatch.setattr(daemon_mod, "_CODE_TAIL_MARGIN", 2)
+    orchestrator, transport = build_orchestrator(make_config())
+    calls: list = []
+    monkeypatch.setattr(
+        transport, "send_markdown",
+        lambda uid, title, text: calls.append(text),
+    )
+    code = "\n".join(f"c{n:02d}" for n in range(40))
+    await orchestrator._send_markdown(f"```python\n{code}\n```")
+    assert len(calls) == 1
+    lines = calls[0].split("\n")
+    assert lines[-1] == "```"
+    assert lines[-4:-1] == ["", "", ""]  # 3 sacrificial blanks (est 1 + margin 2)
+    assert lines[-5] == "c39"            # real code ends just above the padding
+
+
 async def test_build_orchestrator_markdown_sender_lifts_heading_as_title(monkeypatch):
     orchestrator, transport = build_orchestrator(make_config())
     calls: list = []
@@ -1025,6 +1076,99 @@ async def test_serve_stream_once_propagates_cancel(monkeypatch):
     # Keepalive was started and must have been cancelled in the finally block.
     assert client.keepalive_started
     assert client.keepalive_cancelled
+
+
+# --- auto-update check -------------------------------------------------
+
+
+async def test_auto_update_check_notifies_when_behind(monkeypatch):
+    from claude_dingtalk_bridge import self_update
+
+    async def fake_fetch(*_a, **_k):
+        return self_update.CompareResult(behind=3, subjects=["x"])
+
+    monkeypatch.setattr(daemon.self_update, "fetch_and_compare", fake_fetch)
+    orch = _StubOrchestrator()
+    await daemon._auto_update_check(orch)
+    assert len(orch.notices) == 1
+    assert "/update" in orch.notices[0]
+    assert "claude-dingtalk-bridge" in orch.notices[0]
+
+
+async def test_auto_update_check_silent_when_up_to_date(monkeypatch):
+    from claude_dingtalk_bridge import self_update
+
+    async def fake_fetch(*_a, **_k):
+        return self_update.CompareResult(behind=0, subjects=[])
+
+    monkeypatch.setattr(daemon.self_update, "fetch_and_compare", fake_fetch)
+    orch = _StubOrchestrator()
+    await daemon._auto_update_check(orch)
+    assert orch.notices == []
+
+
+async def test_auto_update_check_silent_on_error_but_logs(monkeypatch, caplog):
+    import logging
+
+    async def boom(*_a, **_k):
+        raise daemon.self_update.SelfUpdateError("git fetch failed")
+
+    monkeypatch.setattr(daemon.self_update, "fetch_and_compare", boom)
+    orch = _StubOrchestrator()
+    with caplog.at_level(logging.WARNING, logger="claude_dingtalk_bridge.daemon"):
+        await daemon._auto_update_check(orch)
+    # The check never pushes errors to the phone — only logs them.
+    assert orch.notices == []
+    assert any("auto update check" in r.getMessage().lower() for r in caplog.records)
+
+
+async def test_serve_starts_and_cancels_auto_update_loop(monkeypatch):
+    started = asyncio.Event()
+    state = {"cancelled": False}
+
+    async def fake_loop(orchestrator):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    monkeypatch.setattr(daemon, "_auto_update_loop", fake_loop)
+    client = _FakeStreamClient(credential=None)
+    orch = _StubOrchestrator()
+    serve_task = asyncio.create_task(daemon._serve(client, orch))
+    await started.wait()
+    serve_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await serve_task
+    # The loop is torn down with the rest of the daemon on shutdown.
+    assert state["cancelled"]
+
+
+async def test_auto_update_loop_waits_initial_delay_then_checks(monkeypatch):
+    # The loop sleeps an initial delay, then runs a check; verify it calls the
+    # check without waiting real time by stubbing sleep to break after one pass.
+    checks = []
+
+    async def fake_check(orchestrator):
+        checks.append(orchestrator)
+
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:  # initial delay + one interval → stop the loop
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(daemon, "_auto_update_check", fake_check)
+    monkeypatch.setattr(daemon.asyncio, "sleep", fake_sleep)
+    orch = _StubOrchestrator()
+    with contextlib.suppress(asyncio.CancelledError):
+        await daemon._auto_update_loop(orch)
+    assert sleeps[0] == daemon._AUTO_UPDATE_INITIAL_DELAY
+    assert sleeps[1] == daemon._AUTO_UPDATE_CHECK_INTERVAL
+    assert checks == [orch]
 
 
 def test_extract_title_skips_leading_blank_lines():

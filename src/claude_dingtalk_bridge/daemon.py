@@ -16,6 +16,7 @@ from dingtalk_stream import AckMessage
 from dingtalk_stream.stream import DingTalkStreamClient
 from dingtalk_stream.version import VERSION_STRING
 
+from claude_dingtalk_bridge.chunking import chunk_markdown, pad_code_tail
 from claude_dingtalk_bridge.claude_runner import ClaudeRunner
 from claude_dingtalk_bridge.config import Config, load_config
 from claude_dingtalk_bridge.dingtalk import DingTalkTransport
@@ -25,10 +26,33 @@ from claude_dingtalk_bridge.images import download_image
 from claude_dingtalk_bridge.orchestrator import Orchestrator
 from claude_dingtalk_bridge.projects import ProjectRegistry
 from claude_dingtalk_bridge.stream_reconnect import ReconnectState
+from claude_dingtalk_bridge import self_update
 
 logger = logging.getLogger(__name__)
 
 _OPEN_CONNECTION_TIMEOUT = (5.0, 10.0)  # connect, read
+
+# DingTalk caps a rendered robot message two independent ways (measured
+# 2026-06-02). Over ~20000 characters oToMessages/batchSend hard-rejects (HTTP
+# 400) and the reply is dropped, not clipped; the char count is what matters,
+# but we budget in UTF-8 bytes (always >= the char count) so a pure-ASCII chunk
+# still stays well under 20000.
+_MARKDOWN_BYTE_BUDGET = 16000
+
+# Separately, a message holding a long code block silently loses its last few
+# rendered lines — even behind the "expand" control — and the loss grows with
+# length (~1 line near 35, ~6 near 150). Two defenses work together: cap each
+# chunk's lines so that growing drop stays small and bounded, and pad a code
+# chunk's tail (below) by the length-scaled estimate so the drop eats filler,
+# not code.
+_MARKDOWN_LINE_BUDGET = 200
+_CODE_TAIL_MIN_LINES = 35  # below this a code chunk renders whole; don't pad
+_CODE_TAIL_MARGIN = 2  # safety blanks beyond the length-scaled drop estimate
+
+# Daily self-update check. The first check waits a short delay so the network
+# and stream connection settle after startup; subsequent ones run once a day.
+_AUTO_UPDATE_INITIAL_DELAY = 60
+_AUTO_UPDATE_CHECK_INTERVAL = 24 * 3600
 
 
 def _disable_websocket_proxy() -> None:
@@ -112,8 +136,14 @@ def build_orchestrator(config: Config) -> tuple[Orchestrator, DingTalkTransport]
         await asyncio.to_thread(transport.send_text, user_id, text)
 
     async def send_markdown(text: str) -> None:
-        title = _extract_title(text) or "Claude has replied."
-        await asyncio.to_thread(transport.send_markdown, user_id, title, text)
+        for piece in chunk_markdown(
+            text, _MARKDOWN_BYTE_BUDGET, _MARKDOWN_LINE_BUDGET
+        ):
+            piece = pad_code_tail(
+                piece, _CODE_TAIL_MIN_LINES, _CODE_TAIL_MARGIN
+            )
+            title = _extract_title(piece) or "Claude has replied."
+            await asyncio.to_thread(transport.send_markdown, user_id, title, piece)
 
     runner = ClaudeRunner()
 
@@ -485,6 +515,33 @@ async def _drive_stream_client(
             return
 
 
+async def _auto_update_check(orchestrator: Orchestrator) -> None:
+    """One fetch+compare against origin/main; nudge the phone only if behind.
+
+    Silent when up to date and silent on error — a failed check (e.g. an
+    offline network or an SSH-auth hiccup under launchd's minimal env) is
+    logged, never pushed to the phone, so it can't turn into daily noise.
+    """
+    try:
+        status = await self_update.fetch_and_compare()
+    except Exception:  # noqa: BLE001 - a bad check must stay silent on the phone
+        logger.warning("auto update check failed", exc_info=True)
+        return
+    if status.behind:
+        await orchestrator.notify(
+            "🔔 An update for claude-dingtalk-bridge is available — "
+            "send /update to apply."
+        )
+
+
+async def _auto_update_loop(orchestrator: Orchestrator) -> None:
+    """Check for updates once after an initial delay, then every 24 hours."""
+    await asyncio.sleep(_AUTO_UPDATE_INITIAL_DELAY)
+    while True:
+        await _auto_update_check(orchestrator)
+        await asyncio.sleep(_AUTO_UPDATE_CHECK_INTERVAL)
+
+
 async def _serve(client, orchestrator: Orchestrator) -> None:
     """Run the stream client until the OS asks us to stop, then drain cleanly.
 
@@ -510,6 +567,7 @@ async def _serve(client, orchestrator: Orchestrator) -> None:
             pass
 
     client_task = asyncio.create_task(_drive_stream_client(client))
+    auto_update_task = asyncio.create_task(_auto_update_loop(orchestrator))
     stop_wait = asyncio.create_task(stop.wait())
     try:
         await asyncio.wait(
@@ -519,6 +577,9 @@ async def _serve(client, orchestrator: Orchestrator) -> None:
         stop_wait.cancel()
         with contextlib.suppress(BaseException):
             await stop_wait
+        auto_update_task.cancel()
+        with contextlib.suppress(BaseException):
+            await auto_update_task
         try:
             await orchestrator.shutdown()
         except Exception:  # noqa: BLE001

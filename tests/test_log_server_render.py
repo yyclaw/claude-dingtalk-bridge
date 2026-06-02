@@ -681,12 +681,12 @@ def test_daemon_starting_low_priority():
 def test_verb_daemon_inbound_text():
     html = log_server.render_entry(
         1659, "2026-05-25 16:38:34", "INFO", "daemon",
-        'inbound msgtype=text sender=manager8234 preview="hi"',
+        'inbound msgtype=text sender=manager9523 preview="hi"',
     )
     assert "chip user" in html
     assert "inbound" in html.lower()
     assert "text" in html
-    assert "manager8234" in html
+    assert "manager9523" in html
     assert "hi" in html
 
 

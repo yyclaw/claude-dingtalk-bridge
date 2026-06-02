@@ -1,4 +1,4 @@
-"""The PreToolUse permission hook the bridge installs on the SDK.
+"""The PreToolUse permission hook the daemon installs on the SDK.
 
 One Bash hook is installed. It hard-denies a small fixed set of
 catastrophic literals plus a sibling guard; everything else returns ``{}``
@@ -436,9 +436,8 @@ def make_bash_permission_hook() -> Hook:
         decision = decide_bash(command)
         if decision.verdict == "deny":
             return _output(
-                "deny", f"blocked by bridge safety guard: {decision.reason}"
+                "deny", f"blocked by daemon safety guard: {decision.reason}"
             )
         return {}
 
     return hook
-

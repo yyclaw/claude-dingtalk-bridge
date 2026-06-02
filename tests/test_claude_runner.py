@@ -39,6 +39,17 @@ def test_build_options_sets_cwd():
     assert options.cwd == "/tmp/proj"
 
 
+def test_build_options_appends_nested_fence_instruction_to_system_prompt():
+    runner = ClaudeRunner()
+    options = runner._build_options("/tmp/proj")
+    sp = options.system_prompt
+    assert isinstance(sp, dict) and sp.get("type") == "preset"
+    append = sp.get("append", "")
+    # Static instruction so prompt-cache prefix stays byte-stable across turns.
+    assert "more backticks" in append.lower()
+    assert "outer fence" in append.lower() or "outer code fence" in append.lower()
+
+
 def test_format_elapsed_sub_second_renders_ms():
     from claude_dingtalk_bridge.claude_runner import _format_elapsed
     assert _format_elapsed(0.42) == "420ms"
@@ -265,11 +276,12 @@ def test_build_options_injects_proxy_env_alongside_cache():
 def test_build_options_excludes_dynamic_sections():
     runner = ClaudeRunner()
     options = runner._build_options("/tmp/proj")
-    assert options.system_prompt == {
-        "type": "preset",
-        "preset": "claude_code",
-        "exclude_dynamic_sections": True,
-    }
+    sp = options.system_prompt
+    assert sp["type"] == "preset"
+    assert sp["preset"] == "claude_code"
+    assert sp["exclude_dynamic_sections"] is True
+    # `append` is also static so the cacheable prefix stays byte-stable.
+    assert isinstance(sp.get("append"), str) and sp["append"]
 
 
 def test_set_and_get_session():

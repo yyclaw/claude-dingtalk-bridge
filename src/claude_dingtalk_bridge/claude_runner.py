@@ -1281,6 +1281,19 @@ class ClaudeRunner:
             "type": "preset",
             "preset": "claude_code",
             "exclude_dynamic_sections": True,
+            # The phone client renders sampleMarkdown, so a fenced block whose
+            # content contains a bare closing fence gets terminated early and
+            # the rest leaks out as live markdown. Static append keeps the
+            # cacheable prefix byte-stable.
+            "append": (
+                "When you wrap content in a code fence and that content itself "
+                "contains lines that look like a code fence (a run of three or "
+                "more backticks), the OUTER fence must use more backticks than "
+                "any inner fence — e.g. wrap with four backticks (````) when "
+                "the content has ```. Otherwise the first inner ``` closes "
+                "your outer fence prematurely and the rest renders as live "
+                "markdown on the receiving client."
+            ),
         }
         kwargs["hooks"] = {
             "PreToolUse": [

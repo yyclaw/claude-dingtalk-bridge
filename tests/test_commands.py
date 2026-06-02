@@ -12,6 +12,8 @@ from claude_dingtalk_bridge.commands import CommandType, parse_command
         ("/pwd", CommandType.PWD),
         ("/clear", CommandType.CLEAR),
         ("/help", CommandType.HELP),
+        ("/update", CommandType.UPDATE),
+        ("/UPDATE", CommandType.UPDATE),
         ("/STATUS", CommandType.STATUS),
         ("ok", CommandType.APPROVE),
         ("YES", CommandType.APPROVE),
@@ -125,7 +127,7 @@ def test_resume_with_uuid():
 
 @pytest.mark.parametrize(
     "text",
-    ["/compact", "/context", "/usage", "/COMPACT", "/compact be brief", "  /compact  "],
+    ["/compact", "/context", "/COMPACT", "/compact be brief", "  /compact  "],
 )
 def test_passthrough_commands_parse_as_prompt(text):
     cmd = parse_command(text)
@@ -152,3 +154,79 @@ def test_model_choices_names():
     from claude_dingtalk_bridge.orchestrator import MODEL_NAMES
 
     assert MODEL_NAMES == ("opus", "sonnet", "haiku")
+
+
+@pytest.mark.parametrize(
+    "text,arg",
+    [
+        ("/stop", None),
+        ("/stop all", "all"),
+        ("/stop ALL", "ALL"),
+        ("  /stop  all  ", "all"),
+    ],
+)
+def test_stop_command_parses_optional_arg(text, arg):
+    cmd = parse_command(text)
+    assert cmd.type == CommandType.STOP
+    assert cmd.arg == arg
+
+
+@pytest.mark.parametrize(
+    "text,arg",
+    [
+        ("/queue", None),
+        ("/queue rm 2", "rm 2"),
+        ("/queue rm all", "rm all"),
+        ("/queue clear", "clear"),
+        ("/QUEUE", None),
+        ("  /queue   rm 3 ", "rm 3"),
+    ],
+)
+def test_queue_command_parses(text, arg):
+    cmd = parse_command(text)
+    assert cmd.type == CommandType.QUEUE
+    assert cmd.arg == arg
+
+
+@pytest.mark.parametrize(
+    "text,arg",
+    [
+        ("/help", None),
+        ("/help queue", "queue"),
+        ("/help /queue", "/queue"),
+        ("/HELP resume", "resume"),
+    ],
+)
+def test_help_command_parses_optional_arg(text, arg):
+    cmd = parse_command(text)
+    assert cmd.type == CommandType.HELP
+    assert cmd.arg == arg
+
+
+def test_every_command_has_a_help_entry():
+    """Each user-facing slash command must be documented in HELP so that
+    /help <cmd> and the /help list never reference a missing entry."""
+    from claude_dingtalk_bridge.commands import (
+        HELP,
+        _ARG_COMMANDS,
+        _PASSTHROUGH_COMMANDS,
+        _SLASH_KEYWORDS,
+    )
+
+    documented = set(HELP)
+    for name in (*_SLASH_KEYWORDS, *_ARG_COMMANDS, *_PASSTHROUGH_COMMANDS):
+        assert name.lstrip("/") in documented, f"{name} missing from HELP"
+
+
+def test_help_entry_details_keep_bullets_on_separate_lines():
+    """A multi-bullet detail must not concatenate two bullets onto one line —
+    adjacent string literals without a trailing `\\n` silently merge them."""
+    from claude_dingtalk_bridge.commands import HELP
+
+    for name, entry in HELP.items():
+        if entry.detail is None:
+            continue
+        for line in entry.detail.split("\n"):
+            assert line.count("- `/") <= 1, (
+                f"HELP[{name!r}] detail merges two bullets: {line!r}"
+            )

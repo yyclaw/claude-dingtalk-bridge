@@ -45,6 +45,11 @@ def md_escape(text: str) -> str:
     return text
 
 
+# Empty heading carrying a full-width space: DingTalk's markdown renderer
+# collapses ordinary blank lines, so this forces a visible gap between blocks.
+MD_SPACER = "###### 　"
+
+
 def format_size(num_bytes: int) -> str:
     """Render a byte count the way the TUI does: 1B / 37.9KB / 1.2MB."""
     if num_bytes < 1024:

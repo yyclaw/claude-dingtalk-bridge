@@ -36,6 +36,11 @@ Inbound and outbound messages travel separate paths:
 - **Outbound**: `DingTalkTransport` (`dingtalk.py`) pushes 1:1 messages via the
   DingTalk Open API REST endpoints, managing its own access token. It is
   sync/`requests`-based, called from async code via `asyncio.to_thread`.
+  Markdown replies that exceed DingTalk's per-message limit are split first by
+  `chunking.chunk_markdown` — a **UTF-8 byte**-budgeted, fence-aware splitter
+  that reopens/closes a carried-over code fence across chunk boundaries (so a
+  split mid-block stays valid) — and each piece is run through `pad_code_tail`
+  before send. `daemon.send_markdown` lifts the title per chunk.
 
 `daemon.build_orchestrator` wires everything. The `ClaudeRunner` ↔ orchestrator
 cycle is broken by late assignment: after both exist, the runner's
@@ -47,17 +52,26 @@ cycle is broken by late assignment: after both exist, the runner's
 Single-threaded async coordinator holding all mutable session state.
 
 - One task at a time (`self._task`); prompts arriving mid-task are queued
-  (`self._queue`) and drained sequentially. Exception: a prompt arriving while
+  (`self._queue`) and drained sequentially. `/queue` views the queue, `/queue rm
+  N` drops one, `/queue rm all`/`/queue clear` empties it. A bare `/stop`
+  interrupts the turn and lets the next queued prompt auto-start; `/stop all`
+  interrupts **and** clears the queue (the queue is cleared *before* the abort,
+  so `_run`'s finally can't auto-advance). Exception: a prompt arriving while
   the runner is in its post-turn drain (`runner.is_draining`) calls
   `cancel_drain()` and starts immediately, rather than waiting out a possibly-
   stuck background-agent wait.
 - Control commands (`commands.parse_command`) are handled immediately, never
-  queued: slash-prefixed (`/stop`, `/clear`, `/verbose`, `/debug`, `/model`,
-  `/mode`, `/cd`, `/ls`, `/pwd`, `/status`, `/session`, `/resume`, `/help`; full
-  map in `commands.py`) plus the bare permission replies (`ok`/`yes`/`approve`/👌,
-  `no`/`deny`/`reject`/❌). `/compact`, `/context`, `/usage` are forwarded verbatim
-  to Claude as SDK slash commands. An unrecognized `/...` becomes `UNKNOWN`, not a
-  prompt.
+  queued: slash-prefixed (`/stop [all]`, `/clear`, `/queue`, `/verbose`,
+  `/debug`, `/model`, `/mode`, `/cd`, `/ls`, `/pwd`, `/status`, `/session`,
+  `/resume`, `/update`, `/help [command]`; full map in `commands.py`) plus the bare
+  permission replies (`ok`/`yes`/`approve`/👌, `no`/`deny`/`reject`/❌).
+  `/compact`, `/context` are forwarded verbatim to Claude as SDK slash
+  commands. An unrecognized `/...` becomes `UNKNOWN`, not a prompt.
+- Command help lives in one place: `commands.HELP` (a `{name: HelpEntry}`
+  registry). `/help` renders the grouped one-line list; `/help <command>` adds
+  that entry's `detail`. Inline "usage" errors (e.g. `/resume`, `/queue rm …`)
+  pull from the same registry so help and errors never drift. `_cmd_help`
+  groups by `HELP_GROUPS` order.
 - `handle_audio` and `handle_image` skip command parsing and always run as
   prompts — voice can't reliably dictate slash commands, and an image carries no
   command intent.
@@ -95,6 +109,29 @@ through the configured proxy (`geo.py`, result cached briefly). A mismatch with
 block the turn. `geo.proxy_url` is also pushed into Claude's subprocess env
 (`http_proxy`/`https_proxy`) so its traffic shares the proxy. Omit the section to
 skip both the check and the proxy.
+
+### Self-update (`self_update.py`)
+
+`/update` updates the daemon program itself (its own repo, **not** the user's
+`projects`). `self_update.py` wraps the git/make steps as async subprocess
+helpers (`fetch_and_compare`, `snapshot`, `pull` — `--ff-only` only,
+`run_make`, `trigger_restart_detached`), raising `SelfUpdateError` (carrying the
+captured output) on any failure. `repo_root()` is the package's `parents[2]`
+(the daemon always runs from an editable install). `_cmd_update` refuses while a
+turn runs (like `/cd`), reports "up to date" when not behind, else pulls, runs
+`make setup`/`make config` only when `pyproject.toml`/`config.example.yaml`
+changed, then **confirms before restarting** via `self._restart_confirm` (a
+future the bare `ok`/`no` reply resolves in `_cmd_permission_reply`, ahead of the
+tool-permission path). The restart runs detached (`start_new_session=True`) so
+`launchctl kickstart -k` survives the daemon's own SIGTERM; the new instance's
+CLI path sends the "🔄 Daemon restarted" notice.
+
+`daemon._auto_update_loop` checks once `_AUTO_UPDATE_INITIAL_DELAY` (60s) after
+startup, then every `_AUTO_UPDATE_CHECK_INTERVAL` (24h): a silent
+`fetch_and_compare` that nudges the phone only when behind. Up-to-date and
+errors are silent (errors logged, never pushed) — a failed check (offline, or
+SSH-auth under launchd's minimal `PATH`/no-agent env) can't become daily noise.
+Wired in `_serve`, cancelled on shutdown.
 
 ### Sessions
 
