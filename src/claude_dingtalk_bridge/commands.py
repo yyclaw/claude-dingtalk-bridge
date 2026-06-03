@@ -20,7 +20,8 @@ class CommandType(Enum):
     RESUME = auto()         # arg: number index | session id | None
     MODEL = auto()          # arg: model name | None (None → list models)
     MODE = auto()           # arg: "default" | "acceptEdits" | "bypassPermissions" |
-                            # "plan" | "reset" | None (None → report current state)
+                            # "plan" | "auto" | "dontAsk" | "reset" |
+                            # None (None → report current state)
     QUEUE = auto()          # arg: None (view) | "rm N" | "rm all" | "clear"
     UPDATE = auto()         # update the daemon program itself (no arg)
     UNKNOWN = auto()
@@ -130,7 +131,7 @@ HELP_GROUPS: tuple[str, ...] = (
 # test_every_command_has_a_help_entry guards that.
 HELP: dict[str, HelpEntry] = {
     "stop": HelpEntry(
-        "/stop [all]", "interrupt current running turn", "Task",
+        "/stop [all]", "Interrupt current running turn", "Task",
         "- `/stop` interrupts the running turn; the next queued prompt (if any) "
         "then starts automatically.\n"
         "- `/stop all` interrupts **and** clears the queue.\n"
@@ -176,7 +177,7 @@ HELP: dict[str, HelpEntry] = {
         "context. Add a hint after it (`/compact keep the API design`).",
     ),
     "status": HelpEntry(
-        "/status", "Show runtime status and token usage", "Info",
+        "/status", "Show runtime status, token usage and cost", "Info",
     ),
     "context": HelpEntry(
         "/context", "Show context window usage", "Info",
@@ -210,8 +211,7 @@ HELP: dict[str, HelpEntry] = {
         "Checks this daemon's own repo (`main` vs `origin/main`), and if behind:\n"
         "- pulls the new commits (fast-forward only)\n"
         "- runs `make setup` if dependencies changed\n"
-        "- runs `make config` if the config template changed (reports new keys; "
-        "never overwrites your config)\n"
+        "- runs `make config` if the config template changed\n"
         "- then asks you to confirm before restarting the daemon.\n\n"
         "Unrelated to your project list — it updates the daemon itself.",
     ),

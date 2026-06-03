@@ -530,7 +530,7 @@ async def _auto_update_check(orchestrator: Orchestrator) -> None:
     if status.behind:
         await orchestrator.notify(
             "🔔 An update for claude-dingtalk-bridge is available — "
-            "send /update to apply."
+            "send `/update` to apply."
         )
 
 

@@ -648,7 +648,7 @@ class Orchestrator:
         """
         if self._task is not None and not self._task.done():
             await self._send(
-                "⚠️ A task is running. Send /stop first, then /update."
+                "⚠️ A task is running. Send `/stop` first, then `/update`."
             )
             return
         if self._updating:
@@ -712,7 +712,7 @@ class Orchestrator:
         # confirm before the disruptive kickstart.
         loop = asyncio.get_running_loop()
         self._restart_confirm = loop.create_future()
-        await self._send("✅ Update pulled. Reply ok to restart now, no to skip.")
+        await self._send("✅ Update pulled. Reply `ok` to restart now, `no` to skip.")
         try:
             ok = await asyncio.wait_for(
                 self._restart_confirm,
@@ -727,7 +727,7 @@ class Orchestrator:
             self._restart_confirm = None
         if not ok:
             await self._send(
-                "👍 Restart skipped — the new code loads on the next restart."
+                "📌 Restart skipped — the new code loads on the next restart."
             )
             return
         await self._send("♻️ Restarting now — back in a few seconds.")
