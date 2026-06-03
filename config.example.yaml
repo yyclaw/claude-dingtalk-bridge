@@ -14,9 +14,9 @@ projects:
 # Timeout (seconds) for a permission request; denied automatically on timeout.
 permission_ask_timeout: 600
 
-# Geo gate: omit the whole section to skip the check and the proxy.
-geo:
-  proxy_url: http://127.0.0.1:8118      # local proxy address, shared by http/https
-  geo_service: http://ip-api.com/json   # returns the caller's exit IP geolocation
-  timeout_seconds: 3                    # geo service request timeout, in seconds
-  target_country: US                    # expected exit-IP countryCode
+# # Geo gate: omit the whole section to skip the check and the proxy.
+# geo:
+#   proxy_url: http://127.0.0.1:8118      # local proxy address, shared by http/https
+#   geo_service: http://ip-api.com/json   # returns the caller's exit IP geolocation
+#   timeout_seconds: 3                    # geo service request timeout, in seconds
+#   target_country: US                    # expected exit-IP countryCode
