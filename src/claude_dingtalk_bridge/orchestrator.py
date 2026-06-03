@@ -473,7 +473,7 @@ class Orchestrator:
             project = self._registry.get(name)
             mark = " *(current)*" if name == self._current_project.name else ""
             lines.append(
-                f"- **{md_escape(name)}**{mark} · "
+                f"- **{md_escape(name)}**{mark}<br>"
                 f"{md_escape(display_path(project.path))}"
             )
         await self._send_markdown("\n".join(lines))
