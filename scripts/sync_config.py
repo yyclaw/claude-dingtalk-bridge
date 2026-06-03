@@ -9,14 +9,17 @@ config.example.yaml against the installed config at top-level-key granularity:
   * an active key the user has but the template no longer carries is removed,
     whole block and its trailing blank separator;
   * a key the user deliberately commented out is left untouched -- "absent" and
-    "present but commented" are different.
+    "present but commented" are different;
+  * a key present in both has its leading comment lines refreshed from the
+    template; the user's value lines stay byte-for-byte unchanged, and any
+    user-disabled config key absorbed into the leading range is preserved.
 
 Nested keys differing inside a block can't be added/removed at the end without
 breaking structure, so those are only reported for manual review.
 
 Run:  python scripts/sync_config.py <path-to-user-config>
-The file is rewritten only when a top-level block is added or removed; kept
-blocks stay byte-for-byte unchanged.
+The file is rewritten only when a top-level block is added, removed, or has
+its leading comments refreshed; the bodies of kept blocks are never touched.
 """
 import pathlib
 import re
@@ -50,6 +53,14 @@ def top_level_blocks(lines):
             block.pop()
         blocks[key] = block
     return blocks
+
+
+def split_block(block):
+    """Split a top-level block into (leading_comments, body_from_key_line)."""
+    for i, ln in enumerate(block):
+        if TOP_KEY.match(ln):
+            return block[:i], block[i:]
+    return block, []
 
 
 def protected_lines(lines, known):
@@ -105,9 +116,12 @@ def main():
     example = yaml.safe_load(example_text) or {}
     user = yaml.safe_load(user_text) or {}
 
-    example_blocks = top_level_blocks(example_text.splitlines())
+    example_lines = example_text.splitlines()
+    user_lines = user_text.splitlines()
+
+    example_blocks = top_level_blocks(example_lines)
     active_top = list(user) if isinstance(user, dict) else []
-    commented = {m.group(1) for ln in user_text.splitlines()
+    commented = {m.group(1) for ln in user_lines
                  if (m := COMMENTED_KEY.match(ln))}
 
     to_add, skipped = [], []
@@ -117,7 +131,7 @@ def main():
         (skipped if key in commented else to_add).append(key)
     # A key the template carries only commented-out (an opt-in example) is still
     # "known" -- don't remove the user's active value just because of that.
-    template_known = set(example) | {m.group(1) for ln in example_text.splitlines()
+    template_known = set(example) | {m.group(1) for ln in example_lines
                                      if (m := COMMENTED_KEY.match(ln))}
     to_remove = [k for k in active_top if k not in template_known]
 
@@ -127,15 +141,61 @@ def main():
     nested_extra = [p for p in leaves(user)
                     if p not in example_leaves and p.split(".")[0] in example]
 
-    if to_add or to_remove:
-        user_lines = user_text.splitlines()
-        drop = set()
-        for key, s, e in top_level_spans(user_lines):
-            if key in to_remove:
-                drop.update(range(s, e))
-        drop -= protected_lines(user_lines, template_known)
-        text = "\n".join(ln for i, ln in enumerate(user_lines) if i not in drop)
-        text = text.rstrip("\n")
+    spans = top_level_spans(user_lines)
+    # yaml.safe_load accepts keys whose lines our regex-based span finder can't
+    # locate (unusual leading characters, quoted forms, etc.). We can't safely
+    # modify what we can't locate, so split such keys off and surface them.
+    findable = {k for k, _, _ in spans}
+    unreachable = [k for k in to_remove if k not in findable]
+    to_remove = [k for k in to_remove if k in findable]
+
+    protected = protected_lines(user_lines, template_known)
+    template_leading = {k: split_block(b)[0] for k, b in example_blocks.items()}
+
+    # Detect kept keys whose leading comments diverged from the template. The
+    # comparison ignores protected lines (user-disabled keys absorbed into the
+    # leading range via comment walk-back) so we don't reorder them on a no-op.
+    comment_updates = []
+    remove_set = set(to_remove)
+    for key, s, e in spans:
+        if key not in example_blocks or key in remove_set:
+            continue
+        user_leading = []
+        for i in range(s, e):
+            if TOP_KEY.match(user_lines[i]):
+                break
+            if i not in protected:
+                user_leading.append(user_lines[i])
+        if user_leading != template_leading[key]:
+            comment_updates.append(key)
+
+    if to_add or to_remove or comment_updates:
+        updates_set = set(comment_updates)
+        new_lines = []
+        prev_end = 0
+        for key, s, e in spans:
+            new_lines.extend(user_lines[prev_end:s])
+            if key in remove_set:
+                for i in range(s, e):
+                    if i in protected:
+                        new_lines.append(user_lines[i])
+                prev_end = e
+                continue
+            key_line = s
+            while key_line < e and not TOP_KEY.match(user_lines[key_line]):
+                key_line += 1
+            if key in updates_set:
+                for i in range(s, key_line):
+                    if i in protected:
+                        new_lines.append(user_lines[i])
+                new_lines.extend(template_leading[key])
+            else:
+                new_lines.extend(user_lines[s:key_line])
+            new_lines.extend(user_lines[key_line:e])
+            prev_end = e
+        new_lines.extend(user_lines[prev_end:])
+
+        text = "\n".join(new_lines).rstrip("\n")
         for k in to_add:
             text += "\n\n" + "\n".join(example_blocks[k])
         user_path.write_text(text + "\n")
@@ -148,6 +208,14 @@ def main():
         print("Removed keys no longer in the template:")
         for k in to_remove:
             print(f"  - {k}")
+    if unreachable:
+        print("Keys not in the template but can't be auto-removed (edit manually):")
+        for k in unreachable:
+            print(f"  ? {k}")
+    if comment_updates:
+        print("Refreshed leading comments from the template:")
+        for k in comment_updates:
+            print(f"  * {k}")
     if skipped:
         print("Skipped keys you commented out (left as-is):")
         for k in skipped:
