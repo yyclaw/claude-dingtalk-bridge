@@ -36,7 +36,6 @@ class Command:
 
 # Slash commands taking no argument.
 _SLASH_KEYWORDS: dict[str, CommandType] = {
-    "/ls": CommandType.LIST_PROJECTS,
     "/status": CommandType.STATUS,
     "/pwd": CommandType.PWD,
     "/clear": CommandType.CLEAR,
@@ -49,6 +48,7 @@ _SLASH_KEYWORDS: dict[str, CommandType] = {
 # arrive with arg=None, same as a no-arg keyword.
 _ARG_COMMANDS: dict[str, CommandType] = {
     "/stop": CommandType.STOP,
+    "/ls": CommandType.LIST_PROJECTS,
     "/cd": CommandType.SWITCH_PROJECT,
     "/verbose": CommandType.VERBOSE,
     "/debug": CommandType.DEBUG,
@@ -154,7 +154,11 @@ HELP: dict[str, HelpEntry] = {
         "/pwd", "Show current working directory", "Project",
     ),
     "ls": HelpEntry(
-        "/ls", "List projects", "Project",
+        "/ls [reload]", "List projects", "Project",
+        "- `/ls` lists the configured projects.\n"
+        "- `/ls reload` re-reads the projects from the config file (after you "
+        "edited it) and lists them — no daemon restart needed. If the current "
+        "project was removed, it switches to the first one.",
     ),
     "cd": HelpEntry(
         "/cd <name>", "Switch working directory", "Project",

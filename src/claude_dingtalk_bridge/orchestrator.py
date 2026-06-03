@@ -23,7 +23,14 @@ from claude_dingtalk_bridge.commands import (
     CommandType,
     parse_command,
 )
-from claude_dingtalk_bridge.config import Config
+from pathlib import Path
+
+from claude_dingtalk_bridge.config import (
+    Config,
+    ConfigError,
+    DEFAULT_CONFIG_PATH,
+    load_projects,
+)
 from claude_dingtalk_bridge.geo import GeoCheck
 from claude_dingtalk_bridge import log_context, self_update
 from claude_dingtalk_bridge.projects import ProjectRegistry
@@ -168,9 +175,13 @@ class Orchestrator:
         send: Send,
         send_markdown: Send,
         geo_check: Callable[[], Awaitable[GeoCheck]] | None = None,
+        config_path: Path | str = DEFAULT_CONFIG_PATH,
     ):
         self._config = config
         self._registry = registry
+        # The config file path, re-read by /ls reload to pick up edited
+        # projects. Production always loads from DEFAULT_CONFIG_PATH.
+        self._config_path = config_path
         self._runner = runner
         self._send = send
         # Command replies, Claude-authored text, and the permission prompt
@@ -273,7 +284,7 @@ class Orchestrator:
         elif cmd.type is CommandType.DEBUG:
             await self._cmd_set_dry_run(cmd.arg)
         elif cmd.type is CommandType.LIST_PROJECTS:
-            await self._cmd_list_projects()
+            await self._cmd_list_projects(cmd.arg)
         elif cmd.type is CommandType.SWITCH_PROJECT:
             await self._cmd_switch_project(cmd.arg)
         elif cmd.type is CommandType.STATUS:
@@ -467,7 +478,14 @@ class Orchestrator:
             label="Debug mode",
         )
 
-    async def _cmd_list_projects(self) -> None:
+    async def _cmd_list_projects(self, arg: str | None = None) -> None:
+        verb = (arg or "").strip().lower()
+        if verb == "reload":
+            await self._reload_projects()
+            return
+        if verb:
+            await self._send_markdown("ℹ️ Usage:\n" + HELP["ls"].detail)
+            return
         lines = ["📂 **Projects**", ""]
         for name in self._registry.names():
             project = self._registry.get(name)
@@ -477,6 +495,28 @@ class Orchestrator:
                 f"{md_escape(display_path(project.path))}"
             )
         await self._send_markdown("\n".join(lines))
+
+    async def _reload_projects(self) -> None:
+        """Re-read the projects from the config file (after a manual edit) and
+        list them — no daemon restart needed.
+
+        Only the projects section is reloaded; the live dingtalk/geo config and
+        session state are untouched. If the active project's name vanished
+        (removed or renamed), fall back to the first project via the normal
+        /cd path, which resets that session and announces the switch."""
+        try:
+            projects = load_projects(self._config_path)
+        except ConfigError as exc:
+            await self._send(f"⚠️ Reload failed — keeping current projects.\n{exc}")
+            return
+        self._registry = ProjectRegistry(projects)
+        replacement = self._registry.get(self._current_project.name)
+        if replacement is None:
+            await self._cmd_switch_project(self._registry.default().name)
+        else:
+            # Re-point at the fresh object so an edited path takes effect.
+            self._current_project = replacement
+        await self._cmd_list_projects()
 
     async def _cmd_pwd(self) -> None:
         project = self._current_project

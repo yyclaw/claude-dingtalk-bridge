@@ -37,6 +37,34 @@ class Config:
     geo: GeoConfig | None = None
 
 
+def _parse_projects(raw: dict) -> list[Project]:
+    try:
+        projects = [
+            Project(name=str(p["name"]), path=str(Path(p["path"]).expanduser()))
+            for p in raw["projects"]
+        ]
+    except (KeyError, TypeError) as exc:
+        raise ConfigError(f"Invalid config: {exc}") from exc
+    if not projects:
+        raise ConfigError("At least one project must be configured")
+    return projects
+
+
+def load_projects(path: Path | str = DEFAULT_CONFIG_PATH) -> list[Project]:
+    """Read just the `projects` section from the config file.
+
+    Used by `/ls reload` to pick up edited projects without a restart. It
+    deliberately skips the secret/perm validation `load_config` does — a reload
+    re-reads only the project list, leaving the live dingtalk/geo config and
+    session state untouched.
+    """
+    path = Path(path).expanduser()
+    if not path.exists():
+        raise ConfigError(f"Config file not found: {path}")
+    raw = yaml.safe_load(path.read_text()) or {}
+    return _parse_projects(raw)
+
+
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
     path = Path(path).expanduser()
     if not path.exists():
@@ -52,12 +80,9 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
             f"Run `chmod 600 \"{path}\"` to restrict it to the owner."
         )
     raw = yaml.safe_load(path.read_text()) or {}
+    projects = _parse_projects(raw)
     try:
         dingtalk = raw["dingtalk"]
-        projects = [
-            Project(name=str(p["name"]), path=str(Path(p["path"]).expanduser()))
-            for p in raw["projects"]
-        ]
         geo = None
         if "geo" in raw:
             geo_raw = raw["geo"] or {}
@@ -77,6 +102,4 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         )
     except (KeyError, TypeError) as exc:
         raise ConfigError(f"Invalid config: {exc}") from exc
-    if not config.projects:
-        raise ConfigError("At least one project must be configured")
     return config

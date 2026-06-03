@@ -140,6 +140,15 @@ and an active `_current_project` (defaults to the first in config); `/cd <name>`
 switches it. `/cd` resets the target project's session (and its usage tallies)
 via `runner.reset`, so a switch starts that project fresh.
 
+`/ls reload` picks up a hand-edited `projects` list without restarting the
+daemon: `config.load_projects` re-reads **only** that section (no perm check, no
+other config) and rebuilds the registry. The rest of the config and all session
+state stay live. If the active project's name vanished (removed/renamed), the
+reload falls back to the default via the normal `_cmd_switch_project` path
+(resetting that session and announcing the switch); an edited path on a still-
+present name just re-points `_current_project` at the fresh object. The daemon
+reloads from `_config_path` (defaults to `DEFAULT_CONFIG_PATH`).
+
 `ClaudeRunner` keeps a Claude session ID per project path and passes it as
 `resume` next turn, giving each project a continuous conversation. Sticky until
 `/clear`, `/cd`, or `/resume` drops or replaces it — `/resume` can adopt a

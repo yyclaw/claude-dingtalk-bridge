@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from claude_dingtalk_bridge.config import Config, ConfigError, GeoConfig, load_config
+from claude_dingtalk_bridge.config import (
+    Config,
+    ConfigError,
+    GeoConfig,
+    load_config,
+    load_projects,
+)
 
 VALID = """
 dingtalk:
@@ -125,3 +131,61 @@ def test_load_config_rejects_group_readable(tmp_path):
     path.chmod(0o640)
     with pytest.raises(ConfigError, match="too permissive"):
         load_config(path)
+
+
+def test_load_config_missing_authorized_user_id_raises(write_config):
+    """Projects parse cleanly but the dingtalk/authorized_user_id block is
+    incomplete — load_config's outer except must wrap that as ConfigError."""
+    bad = """
+dingtalk:
+  client_id: x
+  client_secret: y
+projects:
+  - name: p
+    path: /tmp/p
+"""
+    with pytest.raises(ConfigError, match="Invalid config"):
+        load_config(write_config(bad))
+
+
+def test_load_projects_returns_project_list(write_config):
+    projects = load_projects(write_config(VALID))
+    assert len(projects) == 1
+    assert projects[0].name == "multica"
+    assert projects[0].path == str(Path("~/Projects/marmot-multica").expanduser())
+
+
+def test_load_projects_empty_raises(write_config):
+    bad = """
+dingtalk:
+  client_id: x
+  client_secret: y
+authorized_user_id: z
+projects: []
+"""
+    with pytest.raises(ConfigError, match="project"):
+        load_projects(write_config(bad))
+
+
+def test_load_projects_missing_key_raises(write_config):
+    bad = "dingtalk:\n  client_id: x\n  client_secret: y\n"
+    with pytest.raises(ConfigError):
+        load_projects(write_config(bad))
+
+
+def test_load_projects_missing_file_raises(tmp_path):
+    with pytest.raises(ConfigError, match="not found"):
+        load_projects(tmp_path / "nope.yaml")
+
+
+def test_load_projects_ignores_other_sections(write_config):
+    """Reload reads only the projects list — a config whose other sections are
+    absent or broken (here: no dingtalk/authorized_user_id) still yields the
+    projects, since /ls reload must not depend on the rest being re-validated."""
+    only_projects = """
+projects:
+  - name: solo
+    path: /tmp/solo
+"""
+    projects = load_projects(write_config(only_projects))
+    assert [p.name for p in projects] == ["solo"]

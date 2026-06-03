@@ -7,6 +7,7 @@ dingtalk:
 authorized_user_id: "YOUR_STAFF_ID"
 
 # Allowed project directories (the first one is the default project).
+# After editing this list, send `/ls reload` from your phone — no daemon restart needed.
 projects:
   - name: hello-world
     path: ~/Projects/hello-world

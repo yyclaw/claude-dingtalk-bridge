@@ -46,6 +46,8 @@ def test_keyword_is_whitespace_tolerant():
         ("/debug", CommandType.DEBUG, None),
         ("/debug on", CommandType.DEBUG, "on"),
         ("/debug OFF", CommandType.DEBUG, "OFF"),
+        ("/ls", CommandType.LIST_PROJECTS, None),
+        ("/ls reload", CommandType.LIST_PROJECTS, "reload"),
     ],
 )
 def test_on_off_commands(text, ctype, arg):

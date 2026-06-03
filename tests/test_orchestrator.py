@@ -6,7 +6,7 @@ import pytest
 
 import claude_dingtalk_bridge.orchestrator as orch_mod
 from claude_dingtalk_bridge.claude_runner import ResultEvent, TextEvent, ToolEvent
-from claude_dingtalk_bridge.config import Config, Project
+from claude_dingtalk_bridge.config import Config, Project, load_config
 from claude_dingtalk_bridge.orchestrator import Orchestrator
 from claude_dingtalk_bridge.projects import ProjectRegistry
 
@@ -173,6 +173,120 @@ async def _wait_idle(orchestrator):
         await asyncio.sleep(0)
     if orchestrator._task is not None:
         await orchestrator._task
+
+
+def _config_yaml(projects: list[tuple[str, str]]) -> str:
+    lines = [
+        "dingtalk:",
+        "  client_id: k",
+        "  client_secret: s",
+        f"authorized_user_id: {AUTHORIZED}",
+        "projects:",
+    ]
+    for name, path in projects:
+        lines.append(f"  - name: {name}")
+        lines.append(f"    path: {path}")
+    return "\n".join(lines) + "\n"
+
+
+def build_with_file(tmp_path, projects, runner=None):
+    """Build an orchestrator backed by a real config file so /ls reload can
+    re-read it. Returns (orchestrator, runner, sent, path)."""
+    path = tmp_path / "config.yaml"
+    path.write_text(_config_yaml(projects))
+    path.chmod(0o600)
+    config = load_config(path)
+    runner = runner or FakeRunner()
+    sent: list[str] = []
+
+    async def send(text: str) -> None:
+        sent.append(text)
+
+    orchestrator = Orchestrator(
+        config=config,
+        registry=ProjectRegistry(config.projects),
+        runner=runner,
+        send=send,
+        send_markdown=send,
+        config_path=path,
+    )
+    runner.permission_handler = orchestrator.request_permission
+    runner.question_handler = orchestrator.answer_question
+    return orchestrator, runner, sent, path
+
+
+async def test_ls_reload_picks_up_new_project(tmp_path):
+    orchestrator, runner, sent, path = build_with_file(
+        tmp_path, [("multica", "/tmp/multica"), ("docs", "/tmp/docs")]
+    )
+    path.write_text(
+        _config_yaml(
+            [("multica", "/tmp/multica"), ("docs", "/tmp/docs"), ("api", "/tmp/api")]
+        )
+    )
+    await orchestrator.handle_message("/ls reload", AUTHORIZED)
+    assert "api" in orchestrator._registry.names()
+    assert any("api" in m and "/tmp/api" in m for m in sent)
+
+
+async def test_ls_reload_keeps_current_when_still_present(tmp_path):
+    orchestrator, runner, sent, path = build_with_file(
+        tmp_path, [("multica", "/tmp/multica"), ("docs", "/tmp/docs")]
+    )
+    assert orchestrator._current_project.name == "multica"
+    path.write_text(
+        _config_yaml([("multica", "/tmp/multica"), ("api", "/tmp/api")])
+    )
+    await orchestrator.handle_message("/ls reload", AUTHORIZED)
+    assert orchestrator._current_project.name == "multica"
+    # Current project preserved → no session reset.
+    assert runner.resets == []
+
+
+async def test_ls_reload_follows_current_path_change(tmp_path):
+    orchestrator, runner, sent, path = build_with_file(
+        tmp_path, [("multica", "/tmp/multica"), ("docs", "/tmp/docs")]
+    )
+    path.write_text(
+        _config_yaml([("multica", "/tmp/multica-moved"), ("docs", "/tmp/docs")])
+    )
+    await orchestrator.handle_message("/ls reload", AUTHORIZED)
+    assert orchestrator._current_project.name == "multica"
+    assert orchestrator._current_project.path == "/tmp/multica-moved"
+
+
+async def test_ls_reload_falls_back_to_default_when_current_removed(tmp_path):
+    orchestrator, runner, sent, path = build_with_file(
+        tmp_path, [("multica", "/tmp/multica"), ("docs", "/tmp/docs")]
+    )
+    orchestrator._current_project = orchestrator._registry.get("docs")
+    path.write_text(
+        _config_yaml([("multica", "/tmp/multica"), ("api", "/tmp/api")])
+    )
+    await orchestrator.handle_message("/ls reload", AUTHORIZED)
+    assert orchestrator._current_project.name == "multica"
+    # Fallback runs /cd, which resets the now-current project's session and
+    # announces the switch.
+    assert "/tmp/multica" in runner.resets
+    assert any("Switched to" in m and "multica" in m for m in sent)
+
+
+async def test_ls_reload_reports_error_and_keeps_registry(tmp_path):
+    orchestrator, runner, sent, path = build_with_file(
+        tmp_path, [("multica", "/tmp/multica"), ("docs", "/tmp/docs")]
+    )
+    path.write_text("projects: []\n")
+    await orchestrator.handle_message("/ls reload", AUTHORIZED)
+    assert any("Reload failed" in m for m in sent)
+    assert orchestrator._registry.names() == ["multica", "docs"]
+
+
+async def test_ls_unknown_arg_shows_usage(tmp_path):
+    orchestrator, runner, sent, path = build_with_file(
+        tmp_path, [("multica", "/tmp/multica")]
+    )
+    await orchestrator.handle_message("/ls bogus", AUTHORIZED)
+    assert any("Usage" in m and "reload" in m for m in sent)
 
 
 async def test_unauthorized_sender_ignored():
