@@ -6,7 +6,7 @@ import pytest
 
 import claude_dingtalk_bridge.orchestrator as orch_mod
 from claude_dingtalk_bridge.claude_runner import ResultEvent, TextEvent, ToolEvent
-from claude_dingtalk_bridge.config import Config, Project, load_config
+from claude_dingtalk_bridge.config import Config, GeoConfig, Project, load_config
 from claude_dingtalk_bridge.orchestrator import Orchestrator
 from claude_dingtalk_bridge.projects import ProjectRegistry
 
@@ -122,8 +122,12 @@ class FakeRunner:
         self.script = []
 
 
-def build(runner=None, geo_check=None):
+def build(runner=None, geo_check=None, geo_timeout=3):
     config = make_config()
+    # In production geo_check is wired only when config.geo is set; mirror that
+    # so the orchestrator can read geo.timeout_seconds for the slow-notice delay.
+    if geo_check is not None:
+        config.geo = GeoConfig(timeout_seconds=geo_timeout)
     runner = runner or FakeRunner()
     sent: list[str] = []
 
@@ -568,6 +572,26 @@ async def test_geo_failure_skips_turn():
     assert any("skipped" in m and "HK" in m for m in sent)
 
 
+async def test_geo_failure_with_live_timer_cancels_it(monkeypatch):
+    """Failure path while the slow-notice timer is live (delay not None): the
+    timer is cancelled in finally before the 'Turn skipped' notice, and no
+    stray 'still checking' leaks. Failure tests above use a short timeout where
+    no timer is ever created — this exercises the timer-present branch."""
+    monkeypatch.setattr(orch_mod, "_geo_slow_notice_delay", lambda t: 5.0)
+
+    async def geo_check():
+        from claude_dingtalk_bridge.geo import GeoCheck
+        await asyncio.sleep(0)  # let the timer enter its sleep first
+        return GeoCheck(ok=False, detail="📍 IP: 45.8.1.1\n❌ IP location: HK (expected: US)")
+
+    orchestrator, runner, sent = build(geo_check=geo_check, geo_timeout=10)
+    await orchestrator.handle_message("do work", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert runner.turns == []
+    assert any("skipped" in m and "HK" in m for m in sent)
+    assert not any("Checking geo location" in m for m in sent)
+
+
 async def test_geo_pass_runs_turn():
     async def geo_check():
         from claude_dingtalk_bridge.geo import GeoCheck
@@ -592,6 +616,179 @@ async def test_geo_runs_before_dry_run_shortcut():
     assert runner.turns == []
     assert any("skipped" in m for m in sent)
     assert not any("Debug mode" in m and "do work" in m for m in sent)
+
+
+def test_geo_slow_notice_delay_rule():
+    """Below the floor → no notice; above it → 60% of the timeout, rounded,
+    always leaving headroom before the request's own timeout."""
+    assert orch_mod._geo_slow_notice_delay(3) is None    # below floor
+    assert orch_mod._geo_slow_notice_delay(5) is None    # at the floor (==)
+    assert orch_mod._geo_slow_notice_delay(6) == 4.0     # just above floor (3.6↑)
+    assert orch_mod._geo_slow_notice_delay(7) == 4.0     # rounds down (4.2↓)
+    assert orch_mod._geo_slow_notice_delay(8) == 5.0     # rounds up (4.8↑)
+    assert orch_mod._geo_slow_notice_delay(10) == 6.0    # exact (6.0)
+    # All headroom: the delay is strictly less than the timeout for every value
+    # above the floor, so the notice can never coincide with the request's own
+    # timeout (the degeneracy the old fixed 5.0 == default timeout suffered).
+    for t in range(6, 60):
+        assert orch_mod._geo_slow_notice_delay(t) < t
+
+
+async def test_geo_short_timeout_skips_slow_notice():
+    """A timeout at/below the floor gets no slow notice even when the check is
+    slow — the degenerate case where a fixed delay == timeout used to misfire."""
+    async def geo_check():
+        from claude_dingtalk_bridge.geo import GeoCheck
+        await asyncio.sleep(0.02)
+        return GeoCheck(ok=True, detail="✅ IP location verified: US")
+
+    orchestrator, runner, sent = build(geo_check=geo_check, geo_timeout=5)
+    await orchestrator.handle_message("do work", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert not any("Checking geo location" in m for m in sent)
+    assert runner.turns == [("/tmp/multica", "do work")]
+
+
+async def test_geo_slow_check_pushes_wait_notice(monkeypatch):
+    monkeypatch.setattr(orch_mod, "_geo_slow_notice_delay", lambda t: 0.01)
+
+    async def geo_check():
+        from claude_dingtalk_bridge.geo import GeoCheck
+        await asyncio.sleep(0.05)
+        return GeoCheck(ok=True, detail="✅ IP location verified: US")
+
+    orchestrator, runner, sent = build(geo_check=geo_check, geo_timeout=10)
+    await orchestrator.handle_message("do work", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert any("Checking geo location" in m for m in sent)
+    assert runner.turns == [("/tmp/multica", "do work")]
+
+
+async def test_geo_fast_check_stays_silent(monkeypatch):
+    monkeypatch.setattr(orch_mod, "_geo_slow_notice_delay", lambda t: 0.05)
+
+    async def geo_check():
+        from claude_dingtalk_bridge.geo import GeoCheck
+        return GeoCheck(ok=True, detail="✅ IP location verified: US")
+
+    orchestrator, runner, sent = build(geo_check=geo_check, geo_timeout=10)
+    await orchestrator.handle_message("do work", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert not any("Checking geo location" in m for m in sent)
+
+
+async def test_geo_notice_timer_cancelled_after_entering_sleep(monkeypatch):
+    """The timer's CancelledError arm: geo settles after the timer has already
+    entered its sleep, so finally's cancel() unwinds it through the except (vs
+    test_geo_fast_check_stays_silent, where the check returns without ever
+    yielding so the timer is cancelled before it starts)."""
+    monkeypatch.setattr(orch_mod, "_geo_slow_notice_delay", lambda t: 5.0)
+
+    async def geo_check():
+        from claude_dingtalk_bridge.geo import GeoCheck
+        # Yield once so the slow-notice task gets to start its sleep before the
+        # check returns and finally cancels it mid-sleep.
+        await asyncio.sleep(0)
+        return GeoCheck(ok=True, detail="✅ IP location verified: US")
+
+    orchestrator, runner, sent = build(geo_check=geo_check, geo_timeout=10)
+    await orchestrator.handle_message("do work", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert not any("Checking geo location" in m for m in sent)
+    assert runner.turns == [("/tmp/multica", "do work")]
+
+
+async def test_geo_interrupt_clears_slow_notice(monkeypatch):
+    """/clear (or /stop) mid-geo cancels the turn, which clears the timer."""
+    monkeypatch.setattr(orch_mod, "_geo_slow_notice_delay", lambda t: 1.0)
+
+    async def geo_check():
+        from claude_dingtalk_bridge.geo import GeoCheck
+        await asyncio.sleep(5.0)
+        return GeoCheck(ok=True, detail="✅ IP location verified: US")
+
+    orchestrator, runner, sent = build(geo_check=geo_check, geo_timeout=10)
+    await orchestrator.handle_message("do work", AUTHORIZED)
+    task = orchestrator._task
+    await orchestrator.handle_message("/clear", AUTHORIZED)
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    # let the cancelled slow-notice timer settle before asserting
+    await asyncio.sleep(0)
+    assert not any("Checking geo location" in m for m in sent)
+    assert runner.turns == []
+
+
+async def test_geo_slow_notice_suppressed_when_turn_cancelled():
+    """The notice checks _turn_cancelled before sending, so a /stop racing the
+    timer (it fires during interrupt()'s await) doesn't push reassurance just
+    before the 'Task stopped' ack."""
+    orchestrator, runner, sent = build()
+    orchestrator._turn_cancelled = True
+    await orchestrator._geo_slow_notice(0.0)
+    assert not any("Checking geo location" in m for m in sent)
+
+
+async def test_geo_slow_notice_sends_when_active():
+    orchestrator, runner, sent = build()
+    orchestrator._turn_cancelled = False
+    await orchestrator._geo_slow_notice(0.0)
+    assert any("Checking geo location" in m for m in sent)
+
+
+async def test_geo_stop_replies_and_clears_task():
+    """/stop mid-geo must still ack the phone and reset self._task to None.
+
+    Regression: _drain_queue used to live only in the run_turn finally, so a
+    cancel landing during the geo await left self._task non-None and _cmd_stop
+    sent nothing.
+    """
+    async def geo_check():
+        from claude_dingtalk_bridge.geo import GeoCheck
+        await asyncio.sleep(5.0)
+        return GeoCheck(ok=True, detail="✅ IP location verified: US")
+
+    orchestrator, runner, sent = build(geo_check=geo_check)
+    await orchestrator.handle_message("do work", AUTHORIZED)
+    # Let the turn task actually reach the geo await before /stop fires —
+    # in production the two messages arrive on separate WebSocket events with
+    # event-loop ticks between them, but in a single test coroutine we need
+    # to yield once explicitly so cancel hits a running coroutine (whose
+    # finally can run) rather than one that never started.
+    await asyncio.sleep(0)
+    await orchestrator.handle_message("/stop", AUTHORIZED)
+    assert orchestrator._task is None
+    # Phone gets a "Task stopped" ack — but NOT the "say go on to continue"
+    # hint, because nothing was ever started (geo phase aborted).
+    assert any("Task stopped" in m for m in sent)
+    assert not any("go on" in m for m in sent)
+    assert runner.turns == []
+
+
+async def test_geo_stop_auto_advances_queue():
+    """A bare /stop mid-geo lets the queued prompt auto-start, matching the
+    documented behavior of /stop (interrupt + auto-advance)."""
+    geo_calls = 0
+
+    async def geo_check():
+        from claude_dingtalk_bridge.geo import GeoCheck
+        nonlocal geo_calls
+        geo_calls += 1
+        if geo_calls == 1:
+            await asyncio.sleep(5.0)
+        return GeoCheck(ok=True, detail="✅ IP location verified: US")
+
+    orchestrator, runner, sent = build(geo_check=geo_check)
+    await orchestrator.handle_message("first", AUTHORIZED)
+    await asyncio.sleep(0)  # let the first turn reach the geo await
+    # Queue a second prompt while the first is still in geo.
+    orchestrator._queue.append("second")
+    await orchestrator.handle_message("/stop", AUTHORIZED)
+    # Let the auto-advanced second turn complete its (now-fast) geo + run_turn.
+    if orchestrator._task is not None:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await orchestrator._task
+    assert runner.turns == [("/tmp/multica", "second")]
 
 
 async def test_status_shows_dry_run_mode():

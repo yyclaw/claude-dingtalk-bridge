@@ -23,8 +23,10 @@ class Project:
 class GeoConfig:
     proxy_url: str = "http://127.0.0.1:8118"
     target_country: str = "US"
-    geo_service: str = "http://ip-api.com/json"
-    timeout_seconds: int = 3
+    geo_service: str = "https://ipinfo.io/json"
+    timeout_seconds: int = 5
+    country_field: str = "country"
+    ip_field: str = "ip"
 
 
 @dataclass
@@ -89,8 +91,10 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
             geo = GeoConfig(
                 proxy_url=str(geo_raw.get("proxy_url", "http://127.0.0.1:8118")),
                 target_country=str(geo_raw.get("target_country", "US")),
-                geo_service=str(geo_raw.get("geo_service", "http://ip-api.com/json")),
-                timeout_seconds=int(geo_raw.get("timeout_seconds", 3)),
+                geo_service=str(geo_raw.get("geo_service", "https://ipinfo.io/json")),
+                timeout_seconds=int(geo_raw.get("timeout_seconds", 5)),
+                country_field=str(geo_raw.get("country_field", "country")),
+                ip_field=str(geo_raw.get("ip_field", "ip")),
             )
         config = Config(
             dingtalk_client_id=str(dingtalk["client_id"]),

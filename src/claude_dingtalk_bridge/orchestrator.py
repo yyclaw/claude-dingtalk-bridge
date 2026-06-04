@@ -69,6 +69,26 @@ _RESUME_LIST_LIMIT = 7
 # that arrives while the timer is about to fire still suppresses the message.
 _PENDING_NOTICE_DELAY = 30.0
 
+# A geo check goes through the proxy and can stall when the VPN is flaky.
+# When it runs long, reassure the phone that we're still working on it; the
+# notice is cancelled the moment the check settles (result, failure, or user
+# interrupt) so a fast check stays silent. The delay is derived from the
+# configured request timeout rather than fixed: a timeout at or below this floor
+# is short enough to need no notice (the whole check is over too soon to bother),
+# and otherwise the notice fires at 60% of the timeout — always leaving headroom
+# before the request's own timeout, so a slow-but-successful check is reassured,
+# not just a failing one. (A fixed delay >= the timeout could only ever fire as
+# the request was already timing out.)
+_GEO_SLOW_NOTICE_MIN_TIMEOUT = 5
+
+
+def _geo_slow_notice_delay(timeout_seconds: int) -> float | None:
+    """Seconds to wait before the 'still checking geo' notice, or None to skip
+    it entirely for a timeout short enough not to warrant one."""
+    if timeout_seconds <= _GEO_SLOW_NOTICE_MIN_TIMEOUT:
+        return None
+    return float(round(timeout_seconds * 0.6))
+
 # Curated model aliases for the /model command. Mirrors the aliases the
 # Claude CLI accepts for --model; only aliases (no version numbers) so it
 # needn't change as models are bumped. A full model id can still be passed
@@ -218,6 +238,11 @@ class Orchestrator:
         # un-finished subagents.
         self._turn_cancelled = False
         self._turn_sent_text = False
+        # Gates the "say `go on` to continue" hint in /stop's reply: True only
+        # after we've pushed `▶️ Task started`. A /stop landing in the geo phase
+        # otherwise dangles a "continue where it left off" line at the user when
+        # nothing was ever started.
+        self._turn_announced = False
         self._last_todo_render: str | None = None
         self._pending_tasks: set[str] = set()
         self._acknowledged_tasks: set[str] = set()
@@ -354,8 +379,12 @@ class Orchestrator:
         """
         if self._task is None or self._task.done():
             return False
-        await self._runner.interrupt()
+        # Flip the gate before the interrupt await: that await yields, and an
+        # in-flight geo slow-notice timer could fire in the gap — it checks this
+        # flag so it stays silent. It also silences any event the task emits
+        # while it unwinds.
         self._turn_cancelled = True
+        await self._runner.interrupt()
         self._cancel_pending_notice()
         self._task.cancel()
         return True
@@ -404,11 +433,17 @@ class Orchestrator:
                         "The session is kept — send a new prompt anytime."
                     )
                 else:
-                    await self._send(
+                    msg = (
                         "✅ Task stopped.\n"
-                        "The session is kept — send a new prompt anytime.\n"
-                        'Or say "go on" to continue where it left off.'
+                        "The session is kept — send a new prompt anytime."
                     )
+                    # The "go on" hint only makes sense once a turn has actually
+                    # begun (i.e. the `▶️ Task started` banner went out). For a
+                    # /stop landing in the geo phase, nothing was started so
+                    # there's no "left off" to continue from.
+                    if self._turn_announced:
+                        msg += '\nOr say "go on" to continue where it left off.'
+                    await self._send(msg)
         elif stop_all and dropped:
             await self._send(f"🧹 Cleared {dropped} queued prompt(s).")
         else:
@@ -1001,37 +1036,56 @@ class Orchestrator:
         # (`/long/proj/src/x` → `src/x`); paths outside the project but
         # inside $HOME render as `~/…`.
         log_context.set_cwd(project.path)
-        geo_note = ""
-        if self._geo_check is not None:
-            check = await self._geo_check()
-            if not check.ok:
-                await self._send(
-                    f"{check.detail}\n⚠️ Turn skipped — fix the network and resend."
-                )
-                await self._drain_queue()
-                return
-            geo_note = f"\n\n{check.detail}"
-        if self._dry_run:
-            await self._send(
-                f"🐛 Debug mode · {project.name}\n"
-                f"Echo: {_summary(prompt)}{geo_note}"
-            )
-            await self._drain_queue()
-            return
-        await self._send(
-            f"▶️ Task started · {project.name}\n{_summary(prompt)}{geo_note}"
-        )
+        # Outer try/finally so a /stop landing in the geo phase (or anywhere
+        # before run_turn) still drains the queue — without this, self._task
+        # stays set after cancel, the queued prompt doesn't auto-advance, and
+        # _cmd_stop's `self._task is None` check never fires so the phone gets
+        # zero feedback for the /stop.
+        self._turn_announced = False
+        # Reset here (not after the banner) so the geo-phase slow notice can read
+        # this turn's own cancel state — a /stop landing in the geo await flips it
+        # and the notice must honor that.
         self._turn_cancelled = False
-        self._turn_sent_text = False
-        self._last_todo_render = None
-        self._pending_tasks = set()
-        self._acknowledged_tasks = set()
-        self._cancel_pending_notice()
         try:
-            await self._runner.run_turn(project.path, prompt, self._emit)
-        except Exception as exc:  # noqa: BLE001 - surface any failure to phone
-            logger.exception("Task failed")
-            await self._send(f"⚠️ Task failed\n{exc}")
+            geo_note = ""
+            if self._geo_check is not None:
+                delay = _geo_slow_notice_delay(self._config.geo.timeout_seconds)
+                slow_notice = (
+                    asyncio.create_task(self._geo_slow_notice(delay))
+                    if delay is not None
+                    else None
+                )
+                try:
+                    check = await self._geo_check()
+                finally:
+                    if slow_notice is not None:
+                        slow_notice.cancel()
+                if not check.ok:
+                    await self._send(
+                        f"{check.detail}\n⚠️ Turn skipped — fix the network and resend."
+                    )
+                    return
+                geo_note = f"\n\n{check.detail}"
+            if self._dry_run:
+                await self._send(
+                    f"🐛 Debug mode · {project.name}\n"
+                    f"Echo: {_summary(prompt)}{geo_note}"
+                )
+                return
+            await self._send(
+                f"▶️ Task started · {project.name}\n{_summary(prompt)}{geo_note}"
+            )
+            self._turn_announced = True
+            self._turn_sent_text = False
+            self._last_todo_render = None
+            self._pending_tasks = set()
+            self._acknowledged_tasks = set()
+            self._cancel_pending_notice()
+            try:
+                await self._runner.run_turn(project.path, prompt, self._emit)
+            except Exception as exc:  # noqa: BLE001 - surface any failure to phone
+                logger.exception("Task failed")
+                await self._send(f"⚠️ Task failed\n{exc}")
         finally:
             await self._drain_queue()
 
@@ -1111,6 +1165,20 @@ class Orchestrator:
                 "⏱ A background agent hasn't reported back — "
                 "send a message to have Claude check on it."
             )
+
+    async def _geo_slow_notice(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        # A /stop that landed during the geo await flips _turn_cancelled (before
+        # it interrupts), so don't push a "still checking" reassurance moments
+        # before the "Task stopped" ack.
+        if self._turn_cancelled:
+            return
+        await self._send(
+            "⏳ Checking geo location — this is taking a moment, please wait."
+        )
 
     def _cancel_pending_notice(self) -> None:
         if self._pending_notice_task is not None:

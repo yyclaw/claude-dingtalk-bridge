@@ -84,6 +84,8 @@ geo:
   target_country: JP
   geo_service: http://example.com/json
   timeout_seconds: 5
+  country_field: countryCode
+  ip_field: query
 """
 
 
@@ -94,6 +96,8 @@ def test_geo_section_parsed(write_config):
     assert config.geo.target_country == "JP"
     assert config.geo.geo_service == "http://example.com/json"
     assert config.geo.timeout_seconds == 5
+    assert config.geo.country_field == "countryCode"
+    assert config.geo.ip_field == "query"
 
 
 def test_geo_absent_is_none(write_config):
@@ -107,8 +111,10 @@ def test_geo_empty_uses_defaults(write_config):
     assert isinstance(config.geo, GeoConfig)
     assert config.geo.proxy_url == "http://127.0.0.1:8118"
     assert config.geo.target_country == "US"
-    assert config.geo.geo_service == "http://ip-api.com/json"
-    assert config.geo.timeout_seconds == 3
+    assert config.geo.geo_service == "https://ipinfo.io/json"
+    assert config.geo.timeout_seconds == 5
+    assert config.geo.country_field == "country"
+    assert config.geo.ip_field == "ip"
 
 
 def test_load_config_rejects_world_readable(tmp_path):

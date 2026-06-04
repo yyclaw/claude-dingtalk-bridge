@@ -30,6 +30,17 @@ import yaml
 EXAMPLE = pathlib.Path(__file__).resolve().parents[1] / "config.example.yaml"
 TOP_KEY = re.compile(r"^([A-Za-z_][\w-]*):")
 COMMENTED_KEY = re.compile(r"^\s*#\s*([A-Za-z_][\w-]*)\s*:")
+NESTED_KEY = re.compile(r"^\s+([A-Za-z_][\w-]*)\s*:")
+
+# One template section is reconciled at nested-key granularity rather than the
+# whole-block granularity the rest of the script uses. REQUIRED leaves must
+# merely exist (appended to an old user config that predates them); OVERWRITE
+# leaves are forced to the template's exact value wherever they appear, since the
+# daemon depends on the canonical value. Naming concrete fields here is a
+# deliberate, user-approved exception to the otherwise-generic design.
+GEO_KEY = "geo"
+GEO_REQUIRED_LEAVES = ("country_field", "ip_field")
+GEO_OVERWRITE_LEAVES = ("geo_service",)
 
 
 def leaves(node, prefix=""):
@@ -109,6 +120,81 @@ def top_level_spans(lines):
     return spans
 
 
+def _comment_body(line):
+    """Strip one leading `# ` from a commented line to expose the YAML it hides
+    (so indentation under a commented-out block can be read); None if the line
+    isn't a comment."""
+    m = re.match(r"^(\s*)#[ ]?(.*)$", line)
+    return None if m is None else m.group(1) + m.group(2)
+
+
+def required_leaf_template(lines, key, leaves):
+    """Verbatim template line for each of `leaves` nested under top-level `key`."""
+    out, inside = {}, False
+    for ln in lines:
+        if re.match(rf"^{re.escape(key)}\s*:", ln):
+            inside = True
+            continue
+        if inside:
+            if ln.strip() and not ln[:1].isspace():  # next top-level key
+                break
+            if (m := NESTED_KEY.match(ln)) and m.group(1) in leaves:
+                out[m.group(1)] = ln
+    return out
+
+
+def _find_block_head(lines, key):
+    """(index, commented?) of the line opening top-level `key`, active or
+    commented-out; (None, None) if absent."""
+    for i, ln in enumerate(lines):
+        if re.match(rf"^{re.escape(key)}\s*:", ln):
+            return i, False
+        if re.match(rf"^\s*#\s*{re.escape(key)}\s*:", ln):
+            return i, True
+    return None, None
+
+
+def sync_block_leaves(lines, key, required, overwrite, leaf_template):
+    """Reconcile the user's `key` block against the template at nested-key
+    granularity (unlike the whole-block reconciliation elsewhere). `required`
+    leaves are appended when absent; `overwrite` leaves are forced to the
+    template's exact line wherever they appear, and appended when absent. Works
+    whether the block is active or commented out, keeping inserted/replaced lines
+    in the same comment state. Returns (new_lines, added, overwritten)."""
+    head, commented = _find_block_head(lines, key)
+    if head is None:
+        return lines, [], []
+
+    def styled(leaf):
+        return f"# {leaf_template[leaf]}" if commented else leaf_template[leaf]
+
+    lines = list(lines)
+    present, overwritten, last_nested, j = set(), [], head, head + 1
+    while j < len(lines):
+        body = _comment_body(lines[j]) if commented else lines[j]
+        if commented:
+            if body is None:                                   # left the block
+                break
+            if body.strip() and not body[:1].isspace():        # next top-level
+                break
+        elif lines[j].strip() == "" or not lines[j][:1].isspace():
+            break
+        if m := NESTED_KEY.match(body):
+            name = m.group(1)
+            present.add(name)
+            if name in overwrite and name in leaf_template and lines[j] != styled(name):
+                lines[j] = styled(name)
+                overwritten.append(name)
+            last_nested = j
+        j += 1
+
+    added = [k for k in (*required, *overwrite)
+             if k in leaf_template and k not in present]
+    insert = [styled(k) for k in added]
+    new_lines = lines[:last_nested + 1] + insert + lines[last_nested + 1:]
+    return new_lines, added, overwritten
+
+
 def main():
     user_path = pathlib.Path(sys.argv[1])
     example_text = EXAMPLE.read_text()
@@ -169,7 +255,8 @@ def main():
         if user_leading != template_leading[key]:
             comment_updates.append(key)
 
-    if to_add or to_remove or comment_updates:
+    top_level_changed = bool(to_add or to_remove or comment_updates)
+    if top_level_changed:
         updates_set = set(comment_updates)
         new_lines = []
         prev_end = 0
@@ -198,7 +285,19 @@ def main():
         text = "\n".join(new_lines).rstrip("\n")
         for k in to_add:
             text += "\n\n" + "\n".join(example_blocks[k])
-        user_path.write_text(text + "\n")
+        result_lines = text.split("\n")
+    else:
+        result_lines = list(user_lines)
+
+    geo_leaves = (*GEO_REQUIRED_LEAVES, *GEO_OVERWRITE_LEAVES)
+    geo_template = required_leaf_template(example_lines, GEO_KEY, geo_leaves)
+    result_lines, geo_added, geo_overwritten = sync_block_leaves(
+        result_lines, GEO_KEY, GEO_REQUIRED_LEAVES, GEO_OVERWRITE_LEAVES, geo_template)
+    nested_missing = [p for p in nested_missing
+                      if p not in {f"{GEO_KEY}.{k}" for k in geo_added}]
+
+    if top_level_changed or geo_added or geo_overwritten:
+        user_path.write_text("\n".join(result_lines).rstrip("\n") + "\n")
 
     if to_add:
         print("Added new keys from the template (appended at the end):")
@@ -216,6 +315,14 @@ def main():
         print("Refreshed leading comments from the template:")
         for k in comment_updates:
             print(f"  * {k}")
+    if geo_added:
+        print(f"Added required {GEO_KEY} subkeys the template carries:")
+        for k in geo_added:
+            print(f"  + {GEO_KEY}.{k}")
+    if geo_overwritten:
+        print(f"Overwrote {GEO_KEY} subkeys with the template value:")
+        for k in geo_overwritten:
+            print(f"  = {GEO_KEY}.{k}")
     if skipped:
         print("Skipped keys you commented out (left as-is):")
         for k in skipped:

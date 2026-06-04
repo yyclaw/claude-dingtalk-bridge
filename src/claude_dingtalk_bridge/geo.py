@@ -26,8 +26,7 @@ def check_geo(cfg: GeoConfig) -> GeoCheck:
     """Query the exit IP's country through the local proxy.
 
     Any network/parse failure is caught and returned as a non-ok result so
-    the orchestrator never has to handle an exception here. Message wording
-    mirrors the ``cc.fish`` shell function this gate is modeled on.
+    the orchestrator never has to handle an exception here.
     """
     proxies = {"http": cfg.proxy_url, "https": cfg.proxy_url}
     try:
@@ -35,22 +34,19 @@ def check_geo(cfg: GeoConfig) -> GeoCheck:
             cfg.geo_service, proxies=proxies, timeout=cfg.timeout_seconds
         )
         data = resp.json()
+        # Extract inside the try: a service returning a JSON array/scalar (not an
+        # object) would make .get raise, and that must become a non-ok result
+        # rather than an exception that escapes and silently kills the turn.
+        country = data.get(cfg.country_field, "-")
+        ip = data.get(cfg.ip_field, "-")
     except Exception as exc:  # noqa: BLE001 - any failure becomes a non-ok result
         logger.warning("Geo check failed: %s", exc)
         return GeoCheck(ok=False, detail="❌ Connect to the VPN first.")
 
-    if data.get("status") != "success":
-        return GeoCheck(ok=False, detail="❌ Failed to parse geolocation data.")
-
-    code = data.get("countryCode")
-    ip = data.get("query", "")
-    if not code:
-        return GeoCheck(ok=False, detail="❌ Country code not found in response.")
-
-    if code != cfg.target_country:
+    if country != cfg.target_country:
         return GeoCheck(
             ok=False,
-            detail=f"📍 IP: {ip}\n❌ IP location: {code} (expected: {cfg.target_country})",
+            detail=f"📍 IP: {ip}\n❌ IP location: {country} (expected: {cfg.target_country})",
         )
     return GeoCheck(
         ok=True,

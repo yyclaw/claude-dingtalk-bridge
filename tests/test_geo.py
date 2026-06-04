@@ -12,18 +12,19 @@ class FakeResponse:
         return self._payload
 
 
-def _cfg() -> GeoConfig:
-    return GeoConfig(
+def _cfg(**overrides) -> GeoConfig:
+    base = dict(
         proxy_url="http://127.0.0.1:8118",
         target_country="US",
         geo_service="http://geo.test/json",
         timeout_seconds=3,
     )
+    base.update(overrides)
+    return GeoConfig(**base)
 
 
 def test_matching_country_is_ok(monkeypatch):
-    payload = {"status": "success", "countryCode": "US",
-               "query": "1.2.3.4", "city": "LA", "country": "United States"}
+    payload = {"ip": "1.2.3.4", "country": "US", "city": "LA"}
     monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(payload))
     result = check_geo(_cfg())
     assert isinstance(result, GeoCheck)
@@ -31,8 +32,7 @@ def test_matching_country_is_ok(monkeypatch):
 
 
 def test_wrong_country_not_ok(monkeypatch):
-    payload = {"status": "success", "countryCode": "HK",
-               "query": "45.8.1.1", "city": "Hong Kong", "country": "Hong Kong"}
+    payload = {"ip": "45.8.1.1", "country": "HK", "city": "Hong Kong"}
     monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(payload))
     result = check_geo(_cfg())
     assert result.ok is False
@@ -40,19 +40,21 @@ def test_wrong_country_not_ok(monkeypatch):
     assert "45.8.1.1" in result.detail
 
 
-def test_missing_country_code_not_ok(monkeypatch):
-    payload = {"status": "success", "query": "1.2.3.4"}
+def test_missing_country_not_ok(monkeypatch):
+    payload = {"ip": "1.2.3.4"}
     monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(payload))
     result = check_geo(_cfg())
     assert result.ok is False
-    assert result.detail == "❌ Country code not found in response."
+    assert "IP location: - (expected: US)" in result.detail
 
 
-def test_non_success_status_not_ok(monkeypatch):
-    payload = {"status": "fail", "message": "reserved range"}
+def test_custom_field_names(monkeypatch):
+    payload = {"query": "1.2.3.4", "countryCode": "US"}
     monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(payload))
-    result = check_geo(_cfg())
-    assert result.ok is False
+    result = check_geo(_cfg(country_field="countryCode", ip_field="query"))
+    assert result.ok is True
+    assert "1.2.3.4" in result.detail
+    assert "US" in result.detail
 
 
 def test_proxy_error_not_ok(monkeypatch):
@@ -66,10 +68,20 @@ def test_proxy_error_not_ok(monkeypatch):
 
 
 def test_matching_country_detail_shows_ip_and_country(monkeypatch):
-    payload = {"status": "success", "countryCode": "US", "query": "1.2.3.4"}
+    payload = {"ip": "1.2.3.4", "country": "US"}
     monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(payload))
     result = check_geo(_cfg())
     assert result.detail == "📍 IP: 1.2.3.4\n✅ IP location verified: US"
+
+
+def test_non_dict_json_is_not_ok(monkeypatch):
+    """A service returning a JSON array/scalar must become a non-ok result,
+    not an AttributeError that escapes check_geo and kills the turn."""
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: FakeResponse(["unexpected"]))
+    result = check_geo(_cfg())
+    assert result.ok is False
+    assert result.detail == "❌ Connect to the VPN first."
 
 
 def test_passes_proxy_to_requests(monkeypatch):
@@ -79,8 +91,7 @@ def test_passes_proxy_to_requests(monkeypatch):
         seen["url"] = url
         seen["proxies"] = kwargs.get("proxies")
         seen["timeout"] = kwargs.get("timeout")
-        return FakeResponse({"status": "success", "countryCode": "US",
-                             "query": "1.1.1.1", "city": "", "country": ""})
+        return FakeResponse({"ip": "1.1.1.1", "country": "US"})
 
     monkeypatch.setattr(requests, "get", capture)
     check_geo(_cfg())
@@ -95,8 +106,7 @@ def test_cached_check_reuses_success_within_ttl(monkeypatch):
 
     def counted(*a, **k):
         calls["n"] += 1
-        return FakeResponse({"status": "success", "countryCode": "US",
-                             "query": "1.2.3.4"})
+        return FakeResponse({"ip": "1.2.3.4", "country": "US"})
 
     monkeypatch.setattr(requests, "get", counted)
     cached = CachedGeoCheck(_cfg(), ttl_seconds=60)
@@ -107,7 +117,7 @@ def test_cached_check_reuses_success_within_ttl(monkeypatch):
 
 def test_cached_check_expires_after_ttl(monkeypatch):
     monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(
-        {"status": "success", "countryCode": "US", "query": "1.2.3.4"}))
+        {"ip": "1.2.3.4", "country": "US"}))
     clock = {"t": 1000.0}
     monkeypatch.setattr("claude_dingtalk_bridge.geo.time.monotonic",
                         lambda: clock["t"])
@@ -126,8 +136,7 @@ def test_cached_check_does_not_cache_failure(monkeypatch):
 
     def counted(*a, **k):
         calls["n"] += 1
-        return FakeResponse({"status": "success", "countryCode": "HK",
-                             "query": "45.8.1.1"})
+        return FakeResponse({"ip": "45.8.1.1", "country": "HK"})
 
     monkeypatch.setattr(requests, "get", counted)
     cached = CachedGeoCheck(_cfg(), ttl_seconds=60)
