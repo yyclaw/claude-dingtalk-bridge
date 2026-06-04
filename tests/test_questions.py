@@ -1,4 +1,4 @@
-from claude_dingtalk_bridge.questions import format_question, parse_answer
+from claude_dingtalk_bridge.questions import format_question, parse_answer, question_label, question_preview
 
 SINGLE = {
     "question": "Which database should we use?",
@@ -63,6 +63,52 @@ def test_parse_answer_free_text():
 
 def test_parse_answer_out_of_range_is_invalid():
     answer, valid = parse_answer("9", SINGLE["options"])
+    assert valid is False
+    assert answer is None
+
+
+# GAP 1: question_label and question_preview have mirror-opposite priority.
+# These direct assertions catch a mutation that swaps the two field lookups.
+
+
+def test_question_label_prefers_header():
+    assert question_label({"header": "H", "question": "Q"}) == "H"
+
+
+def test_question_label_falls_back_to_question():
+    assert question_label({"question": "Q"}) == "Q"
+
+
+def test_question_label_empty_dict():
+    assert question_label({}) == ""
+
+
+def test_question_preview_prefers_question():
+    assert question_preview({"header": "H", "question": "Q"}) == "Q"
+
+
+def test_question_preview_falls_back_to_header():
+    assert question_preview({"header": "H"}) == "H"
+
+
+def test_question_preview_empty_dict():
+    assert question_preview({}) == ""
+
+
+# GAP 2: parse_answer lower-bound check. '0'.isdigit() is True, so '0' enters
+# the numeric branch and must be rejected by the `1 <= n` guard — a mutation
+# changing the lower bound to '0' would make '0' resolve to options[-1].
+
+
+def test_parse_answer_zero_is_out_of_range():
+    answer, valid = parse_answer("0", SINGLE["options"])
+    assert valid is False
+    assert answer is None
+
+
+def test_parse_answer_zero_in_multi_is_out_of_range():
+    # Even when mixed with a valid number the whole reply must be rejected.
+    answer, valid = parse_answer("0,1", SINGLE["options"])
     assert valid is False
     assert answer is None
 

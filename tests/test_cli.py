@@ -166,6 +166,34 @@ def test_notify_phone_reports_failure_to_stderr_without_raising(capsys, monkeypa
     assert "config gone" in err
 
 
+def test_notify_phone_reports_send_text_failure_to_stderr_without_raising(capsys, monkeypatch):
+    # load_config succeeds but the network call fails -- a distinct failure class
+    # from the config-error path tested above.  The except must catch it and
+    # include the exception text so the operator can diagnose it from stderr.
+    fake_config = type(
+        "C", (), {
+            "dingtalk_client_id": "id",
+            "dingtalk_client_secret": "secret",
+            "authorized_user_id": "staff-1",
+        },
+    )()
+
+    class _FailingTransport:
+        def __init__(self, client_id, client_secret):
+            pass
+
+        def send_text(self, user_id, text):
+            raise RuntimeError("network timeout")
+
+    monkeypatch.setattr("claude_dingtalk_bridge.config.load_config", lambda: fake_config)
+    monkeypatch.setattr("claude_dingtalk_bridge.dingtalk.DingTalkTransport", _FailingTransport)
+    # Must not raise -- the launchd action already succeeded.
+    cli._notify_phone("hello")
+    err = capsys.readouterr().err
+    assert "could not send phone notice" in err
+    assert "network timeout" in err
+
+
 def test_cli_run_as_main_module(monkeypatch):
     import runpy
     import sys

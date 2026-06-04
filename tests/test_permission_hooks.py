@@ -330,6 +330,8 @@ async def test_hook_tripwire_returns_deny():
     out = await hook(_input("Bash", "rm -rf ~/foo"), None, {})
     assert _verdict(out) == "deny"
     assert "rm -f" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    # The SDK validates this field before acting on permissionDecision.
+    assert out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
 
 
 async def test_hook_variable_command_returns_deny():
@@ -337,6 +339,8 @@ async def test_hook_variable_command_returns_deny():
     out = await hook(_input("Bash", "$C /tmp/x"), None, {})
     assert _verdict(out) == "deny"
     assert "variable" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    # The SDK validates this field before acting on permissionDecision.
+    assert out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
 
 
 async def test_hook_node_eval_literal_rm_returns_deny():

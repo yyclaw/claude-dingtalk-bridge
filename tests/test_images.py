@@ -84,6 +84,57 @@ def test_download_image_refuses_symlinked_parent_dir(monkeypatch, tmp_path):
         images.download_image("http://example.com/x")
 
 
+def test_download_image_boundary_exact_max_accepted(monkeypatch, tmp_path):
+    # size == _MAX_IMAGE_BYTES must succeed; the check is strict >, not >=.
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(images, "_IMAGE_DIR", cache)
+    monkeypatch.setattr(images, "_MAX_IMAGE_BYTES", 8)
+    monkeypatch.setattr(
+        images.requests, "get", _fake_get(b"x" * 8, "image/png")
+    )
+    path = images.download_image("http://example.com/x")
+    assert path.read_bytes() == b"x" * 8
+
+
+def test_download_image_boundary_one_over_max_raises(monkeypatch, tmp_path):
+    # size == _MAX_IMAGE_BYTES + 1 must raise and leave no partial file.
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(images, "_IMAGE_DIR", cache)
+    monkeypatch.setattr(images, "_MAX_IMAGE_BYTES", 8)
+    monkeypatch.setattr(
+        images.requests, "get", _fake_get(b"x" * 9, "image/png")
+    )
+    with pytest.raises(ValueError):
+        images.download_image("http://example.com/x")
+    assert list(cache.iterdir()) == []
+
+
+def test_download_image_closes_response_on_http_error(monkeypatch, tmp_path):
+    # response.close() in the finally must fire even when raise_for_status raises.
+    import requests as req_lib
+
+    cache = tmp_path / "cache"
+    monkeypatch.setattr(images, "_IMAGE_DIR", cache)
+    closed = []
+
+    class _ErrorResponse:
+        headers = {"Content-Type": "image/png"}
+
+        def raise_for_status(self):
+            raise req_lib.HTTPError("404 Not Found")
+
+        def iter_content(self, chunk_size):
+            return iter([])
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(images.requests, "get", lambda *a, **kw: _ErrorResponse())
+    with pytest.raises(req_lib.HTTPError):
+        images.download_image("http://example.com/x")
+    assert closed == [True], "response.close() must be called via the finally block"
+
+
 def test_download_image_prunes_stale_files_tolerating_errors(monkeypatch, tmp_path):
     import os
 

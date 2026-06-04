@@ -101,6 +101,30 @@ def test_send_does_not_retry_more_than_once():
     assert post.call_count == 4
 
 
+def test_stale_token_within_margin_triggers_refetch():
+    # token is present but expires within the refresh margin — the cache guard
+    # (time.time() < expiry - margin) is false, so a new fetch must happen.
+    import time
+    from claude_dingtalk_bridge.dingtalk import _TOKEN_REFRESH_MARGIN
+
+    transport = DingTalkTransport("appkey", "secret")
+    transport._token = "old-tok"
+    transport._token_expiry = time.time() + _TOKEN_REFRESH_MARGIN - 1  # inside margin
+
+    fresh_token = MagicMock()
+    fresh_token.json.return_value = {"accessToken": "new-tok", "expireIn": 7200}
+    fresh_token.raise_for_status.return_value = None
+
+    with patch("claude_dingtalk_bridge.dingtalk.requests.post") as post:
+        post.side_effect = [fresh_token, _ok_response()]
+        transport.send_text("staff-9", "hello")
+
+    # First call must be a token fetch, not a send with the stale token.
+    assert post.call_count == 2
+    assert post.call_args_list[0].args[0].endswith("/oauth2/accessToken")
+    assert post.call_args_list[1].kwargs["headers"]["x-acs-dingtalk-access-token"] == "new-tok"
+
+
 def test_send_markdown_uses_markdown_key():
     transport = DingTalkTransport("appkey", "secret")
     with patch("claude_dingtalk_bridge.dingtalk.requests.post") as post:

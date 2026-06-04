@@ -995,3 +995,56 @@ def test_data_raw_escapes_html_special_chars():
     assert "&lt;dangerous&gt;" in raw
     assert "&amp;" in raw
     assert "&#x27;" in raw or "&#39;" in raw  # single quote escaped
+
+
+# ─── orchestrator permission escalate / reply / timeout verbs ────────────
+
+
+def test_verb_permission_escalate_renders_ask_chip():
+    # An escalation (ask) — the daemon sends the permission question to the
+    # phone and awaits a reply; must render as the "needs human" ask family.
+    html = log_server.render_entry(
+        50, "2026-05-25 12:00:00", "INFO", "orchestrator",
+        "session=03cdbc4a turn=1 permission escalate "
+        "tool=Bash input=rm -rf /tmp/scratch",
+    )
+    assert 'chip ask"' in html or 'chip ask ' in html or "chip ask>" in html or "chip ask" in html
+    assert "🔐 permission ask" in html
+    # Denied chips must be absent — this is an open question, not a verdict.
+    assert "chip crit" not in html
+    assert "denied" not in html
+    assert "Bash" in html
+
+
+def test_verb_permission_reply_allowed_renders_allowed_chip_not_denied():
+    # result=allowed → the phone approved; render with the ask-out chip (yellow
+    # outline) and "🔐 allowed" label. The critical/denied chip must NOT appear
+    # — a mutation to the `result == "allowed"` branch would flip this.
+    html = log_server.render_entry(
+        51, "2026-05-25 12:00:05", "INFO", "orchestrator",
+        "session=03cdbc4a turn=1 permission reply "
+        "tool=Bash result=allowed waited=4.8s",
+    )
+    assert 'chip ask-out"' in html or "chip ask-out" in html
+    assert "🔐 allowed" in html
+    # denied variants must be absent when the user said yes.
+    assert "chip crit" not in html
+    assert "denied" not in html
+    assert "4.8s" in html
+
+
+def test_verb_permission_timeout_renders_denied_timeout_chip():
+    # result is not allowed (omitted / denied by timeout); kind="timeout" is
+    # threaded through as the label suffix so "denied · timeout" distinguishes
+    # it from a user-explicit "denied · reply". The critical (red) chip marks
+    # it as an adverse outcome.
+    html = log_server.render_entry(
+        52, "2026-05-25 12:01:00", "INFO", "orchestrator",
+        "session=03cdbc4a turn=1 permission timeout "
+        "tool=Bash result=denied waited=60.0s",
+    )
+    assert "chip crit" in html
+    assert "🚫 denied · timeout" in html
+    # Must NOT render as a plain "reply" denial — kind must thread through.
+    assert "denied · reply" not in html
+    assert "60.0s" in html

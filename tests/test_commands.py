@@ -75,6 +75,18 @@ def test_unknown_slash_command():
         assert cmd.arg == text
 
 
+def test_no_arg_slash_command_with_trailing_text_is_unknown():
+    # No-arg keywords require an exact match; trailing text makes the full
+    # string unrecognised, so it must be UNKNOWN (a typo), not PROMPT.
+    for verb in ("/pwd", "/status", "/clear", "/session", "/update"):
+        cmd = parse_command(f"{verb} extra")
+        assert cmd.type == CommandType.UNKNOWN, (
+            f"'{verb} extra' should be UNKNOWN, not {cmd.type}"
+        )
+        # Bare form still resolves to the correct command type.
+        assert parse_command(verb).type != CommandType.UNKNOWN
+
+
 def test_plain_text_is_prompt():
     cmd = parse_command("帮我修复登录页的 bug")
     assert cmd.type == CommandType.PROMPT

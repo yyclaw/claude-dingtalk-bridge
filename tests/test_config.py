@@ -57,6 +57,22 @@ projects: []
         load_config(write_config(bad))
 
 
+def test_duplicate_project_names_raise(write_config):
+    bad = """
+dingtalk:
+  client_id: x
+  client_secret: y
+authorized_user_id: z
+projects:
+  - name: dup
+    path: /tmp/a
+  - name: dup
+    path: /tmp/b
+"""
+    with pytest.raises(ConfigError, match="Duplicate project names: dup"):
+        load_config(write_config(bad))
+
+
 def test_defaults_applied(write_config):
     minimal = """
 dingtalk:
@@ -182,6 +198,43 @@ def test_load_projects_missing_key_raises(write_config):
 def test_load_projects_missing_file_raises(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_projects(tmp_path / "nope.yaml")
+
+
+# --- Gap 1: int() raises ValueError on non-integer strings ---
+
+def test_non_integer_permission_ask_timeout_raises(write_config):
+    # int("not-a-number") would escape as ValueError without the fix at config.py:107
+    bad = VALID.replace("permission_ask_timeout: 300", "permission_ask_timeout: not-a-number")
+    with pytest.raises(ConfigError, match="Invalid config"):
+        load_config(write_config(bad))
+
+
+def test_non_integer_geo_timeout_seconds_raises(write_config):
+    text = VALID + "geo:\n  timeout_seconds: bad\n"
+    with pytest.raises(ConfigError, match="Invalid config"):
+        load_config(write_config(text))
+
+
+# --- Gap 2: other-execute bit (0o001) must be caught by the 0o077 mask ---
+
+def test_load_config_rejects_other_execute(tmp_path):
+    # 0o601 & 0o077 == 0o001, so the mask catches it; guards against mask
+    # narrowing mutations such as 0o070 that would miss the other-execute bit
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID)
+    path.chmod(0o601)
+    with pytest.raises(ConfigError, match="too permissive"):
+        load_config(path)
+
+
+# --- Gap 3: a blank `geo:` key (null value) disables geo, like omitting it ---
+
+def test_geo_null_value_disables_geo(write_config):
+    # A half-written `geo:` section (null value) must not silently enable the
+    # default proxy; only an explicit mapping (`geo: {}` or with content) opts
+    # in. See test_geo_empty_uses_defaults for the explicit-empty case.
+    config = load_config(write_config(VALID + "geo:\n"))
+    assert config.geo is None
 
 
 def test_load_projects_ignores_other_sections(write_config):

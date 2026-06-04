@@ -29,6 +29,18 @@ def test_md_escape_neutralizes_special_chars():
     assert "&#38;#" not in md_escape("x*y")
 
 
+def test_md_escape_ampersand_escaped_exactly_once():
+    # Proves the '&' entry exists in _MD_ENTITIES (a mutation removing it
+    # would leave '&' literal) and that '&' is processed first so the '&#38;'
+    # it emits is not re-escaped into '&#38;#38;' (double-escape bug).
+    result = md_escape("a&b")
+    assert result == "a&#38;b"          # '&' → '&#38;', no other change
+    assert "&#38;#" not in result       # no double-escape of the emitted entity
+
+    # Mixed: both '&' and another escapable char must each be escaped once.
+    assert md_escape("a&b<c") == "a&#38;b&#60;c"
+
+
 def test_format_size_buckets():
     assert format_size(0) == "0B"
     assert format_size(1023) == "1023B"

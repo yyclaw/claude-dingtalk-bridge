@@ -3075,6 +3075,73 @@ async def test_drain_returns_silently_when_stream_ends(monkeypatch):
     )
 
 
+def test_log_sdk_message_overage_active_surfaces_at_info(caplog):
+    # GAP 1: status='allowed' + overage_status='active' must NOT be quiet.
+    # The docstring names overage becoming active as a real failure mode —
+    # only ("rejected", None) are the normal no-overage states.
+    # A mutation adding 'active' to the quiet tuple would make this fail.
+    msg = RateLimitEvent(
+        rate_limit_info=RateLimitInfo(
+            status="allowed",
+            overage_status="active",
+            rate_limit_type="five_hour",
+            resets_at=1779550000,
+        ),
+        uuid="u", session_id="s",
+    )
+    with caplog.at_level(_logging.INFO, logger="claude_dingtalk_bridge.claude_runner"):
+        _log_sdk_message(msg)
+    info_lines = [r.getMessage() for r in caplog.records if r.levelno == _logging.INFO]
+    assert info_lines, "overage_status='active' must surface at INFO, not be demoted to DEBUG"
+
+
+async def test_drain_pending_guard_prevents_early_exit_on_mid_drain_result(monkeypatch):
+    # GAP 2: the drain guard is `if not pending and isinstance(message, ResultMessage)`.
+    # With two subagents started before the main ResultMessage, delivering
+    # notification+relay+ResultMessage for only subagent-1 leaves subagent-2
+    # still pending. The drain must NOT exit at that mid-drain ResultMessage —
+    # it must keep waiting until the hard timeout fires and emit a timeout event
+    # for subagent-2. Removing `not pending` from the guard would cause the
+    # drain to exit early and this assertion would fail.
+    from claude_agent_sdk import (
+        AssistantMessage,
+        TaskNotificationMessage,
+        TaskStartedMessage,
+        TextBlock,
+    )
+    from claude_dingtalk_bridge.claude_runner import TaskEvent
+
+    started1 = TaskStartedMessage(
+        subtype="task_started", data={"subagent_type": "general-purpose"},
+        task_id="t1", description="Agent 1", uuid="u1", session_id="s",
+    )
+    started2 = TaskStartedMessage(
+        subtype="task_started", data={"subagent_type": "general-purpose"},
+        task_id="t2", description="Agent 2", uuid="u2", session_id="s",
+    )
+    notified1 = TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="t1",
+        status="completed", output_file="/tmp/o", summary="A1 done",
+        uuid="u3", session_id="s",
+    )
+    relay1 = AssistantMessage(content=[TextBlock("Agent 1 answer")], model="opus")
+    # After this ResultMessage, pending={t2} — drain must NOT exit here.
+    # t2 hangs forever, so the hard timeout will fire and surface t2 as timeout.
+    script = [
+        started1, started2, _result_message(),
+        notified1, relay1, _result_message(),
+        FakeSDKClient.HANG,
+    ]
+    runner, events = await _run_turn_with(monkeypatch, script, timeout=0.05)
+    timeout_tasks = [
+        e.task_id for e in events
+        if isinstance(e, TaskEvent) and e.phase == "timeout"
+    ]
+    assert "t2" in timeout_tasks, (
+        "subagent-2 must time out — drain exited early on the mid-drain ResultMessage"
+    )
+
+
 async def test_drain_returns_when_cancel_set_after_consume(monkeypatch):
     # Race arm: cancel_drain() can land *during* a _consume() call (the
     # consume itself has await points). After consume returns, drain checks

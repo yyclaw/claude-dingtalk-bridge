@@ -45,6 +45,23 @@ def test_format_session_list_marks_current():
     assert "💬 `/resume <n>` to switch" in text
 
 
+def test_format_session_list_current_marker_on_correct_entry():
+    # Two entries; only entry 2 is current. Splitting on '\n\n' gives per-entry
+    # blocks, letting us assert which numbered block carries '⭐ current'.
+    # A mutation flipping == to != in sessions.py:48 would put the marker on
+    # entry 1 and fail this test even though '⭐ current' is still in the full text.
+    infos = [
+        FakeInfo("aaaaaaaa-0000-0000-0000-000000000000", "fix login", 0, "main"),
+        FakeInfo("bbbbbbbb-0000-0000-0000-000000000000", "write docs", 0),
+    ]
+    text = format_session_list(infos, current_id=infos[1].session_id)
+    blocks = text.split("\n\n")
+    entry1 = next(b for b in blocks if "**1." in b)
+    entry2 = next(b for b in blocks if "**2." in b)
+    assert "⭐ current" not in entry1
+    assert "⭐ current" in entry2
+
+
 def test_format_session_list_branchless_entry():
     infos = [FakeInfo("aaaaaaaa-0000-0000-0000-000000000000", "no branch", 0)]
     text = format_session_list(infos, current_id=None)

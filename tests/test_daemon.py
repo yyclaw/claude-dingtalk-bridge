@@ -644,8 +644,8 @@ async def test_chat_handler_logs_every_inbound_message(caplog):
     inbound = [r.getMessage() for r in caplog.records
                if r.getMessage().startswith("inbound ")]
     assert len(inbound) == 3
-    # Sender id is masked to first-3 + ****** + last-3; raw value must not leak.
-    masked = "sta******f-1"
+    # Sender id is masked to first-2 + *** + last-2; raw value must not leak.
+    masked = "st***-1"
     assert all("staff-1" not in m for m in inbound)
     assert any("msgtype=text" in m and masked in m for m in inbound)
     assert any("msgtype=audio" in m and masked in m for m in inbound)
@@ -653,11 +653,19 @@ async def test_chat_handler_logs_every_inbound_message(caplog):
 
 
 def test_mask_sender_masks_long_value_and_handles_empty():
-    # Normal-length staff id: first-3 + ****** + last-3.
-    assert _mask_sender("staff-12345") == "sta******345"
+    # Normal-length staff id: first-2 + *** + last-2.
+    assert _mask_sender("staff-12345") == "st***45"
     # Empty / missing sender falls back to "?" so the log line stays parseable.
     assert _mask_sender("") == "?"
     assert _mask_sender(None) == "?"
+
+
+def test_mask_sender_short_id_fully_masked():
+    # Ids of 4 chars or fewer can't be masked by first-2 + last-2 without
+    # exposing (or duplicating) the whole value, so they're masked entirely.
+    assert _mask_sender("abc") == "***"    # 3 chars: slices would overlap
+    assert _mask_sender("abcd") == "***"   # 4 chars: slices would expose all
+    assert _mask_sender("abcde") == "ab***de"  # 5 chars: 'c' stays hidden
 
 
 async def test_chat_handler_richtext_drops_non_text_non_image_items():

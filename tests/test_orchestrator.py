@@ -285,6 +285,21 @@ async def test_ls_reload_reports_error_and_keeps_registry(tmp_path):
     assert orchestrator._registry.names() == ["multica", "docs"]
 
 
+async def test_ls_reload_rejects_duplicate_names_and_keeps_registry(tmp_path):
+    # A hand-edited config with duplicate names must fail the reload cleanly —
+    # the user is editing from their phone, so they need a message, not a crash,
+    # and the live projects must survive untouched.
+    orchestrator, runner, sent, path = build_with_file(
+        tmp_path, [("multica", "/tmp/multica"), ("docs", "/tmp/docs")]
+    )
+    path.write_text(
+        _config_yaml([("multica", "/tmp/multica"), ("multica", "/tmp/other")])
+    )
+    await orchestrator.handle_message("/ls reload", AUTHORIZED)
+    assert any("Reload failed" in m and "multica" in m for m in sent)
+    assert orchestrator._registry.names() == ["multica", "docs"]
+
+
 async def test_ls_unknown_arg_shows_usage(tmp_path):
     orchestrator, runner, sent, path = build_with_file(
         tmp_path, [("multica", "/tmp/multica")]

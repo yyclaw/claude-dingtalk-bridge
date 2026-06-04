@@ -49,6 +49,16 @@ def _parse_projects(raw: dict) -> list[Project]:
         raise ConfigError(f"Invalid config: {exc}") from exc
     if not projects:
         raise ConfigError("At least one project must be configured")
+    names = [p.name for p in projects]
+    # Duplicate names collapse silently in lookups while `/ls` still shows both,
+    # so `/cd <name>` reaches an entry the listing never disambiguated. Surface
+    # it as a ConfigError so both startup and `/ls reload` report it cleanly —
+    # the reload path catches ConfigError and keeps the live projects, which
+    # matters when the user is editing config from their phone, away from the
+    # machine, and can't see a crash.
+    if len(names) != len(set(names)):
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        raise ConfigError(f"Duplicate project names: {', '.join(dupes)}")
     return projects
 
 
@@ -86,16 +96,23 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
     try:
         dingtalk = raw["dingtalk"]
         geo = None
-        if "geo" in raw:
-            geo_raw = raw["geo"] or {}
-            geo = GeoConfig(
-                proxy_url=str(geo_raw.get("proxy_url", "http://127.0.0.1:8118")),
-                target_country=str(geo_raw.get("target_country", "US")),
-                geo_service=str(geo_raw.get("geo_service", "https://ipinfo.io/json")),
-                timeout_seconds=int(geo_raw.get("timeout_seconds", 5)),
-                country_field=str(geo_raw.get("country_field", "country")),
-                ip_field=str(geo_raw.get("ip_field", "ip")),
-            )
+        # A blank `geo:` key (null value) means "off", same as omitting it — a
+        # half-written section must not silently route traffic through the
+        # default proxy. An explicit empty mapping (`geo: {}`) still opts in
+        # with defaults.
+        geo_raw = raw.get("geo")
+        if geo_raw is not None:
+            # Only coerce keys actually present; missing ones fall to the
+            # GeoConfig field defaults, the single source of those values.
+            geo_kwargs = {
+                field: str(geo_raw[field])
+                for field in ("proxy_url", "target_country", "geo_service",
+                              "country_field", "ip_field")
+                if field in geo_raw
+            }
+            if "timeout_seconds" in geo_raw:
+                geo_kwargs["timeout_seconds"] = int(geo_raw["timeout_seconds"])
+            geo = GeoConfig(**geo_kwargs)
         config = Config(
             dingtalk_client_id=str(dingtalk["client_id"]),
             dingtalk_client_secret=str(dingtalk["client_secret"]),
@@ -104,6 +121,6 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
             permission_ask_timeout=int(raw.get("permission_ask_timeout", 600)),
             geo=geo,
         )
-    except (KeyError, TypeError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         raise ConfigError(f"Invalid config: {exc}") from exc
     return config

@@ -190,10 +190,15 @@ def build_image_prompt(parts: list[tuple[str, str]]) -> str:
 
 def _mask_sender(sender: str | None) -> str:
     # Sender staff id can identify a real person; the inbound log is the only
-    # place we routinely emit it, so mask to first-3 + ****** + last-3.
+    # place we routinely emit it, so mask to first-2 + *** + last-2.
     if not sender:
         return "?"
-    return f"{sender[:3]}******{sender[-3:]}"
+    # first-2 + last-2 only hides anything when the two slices clear each other
+    # with a gap (len > 4); shorter ids would expose or duplicate the whole
+    # value, so mask them entirely.
+    if len(sender) <= 4:
+        return "***"
+    return f"{sender[:2]}***{sender[-2:]}"
 
 
 def _log_inbound(msg: dingtalk_stream.ChatbotMessage) -> None:

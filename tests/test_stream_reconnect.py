@@ -42,6 +42,16 @@ def test_short_session_does_not_reset_backoff():
     assert state.on_disconnect(connection_duration=5.0) == 90.0
 
 
+def test_exact_stable_threshold_resets_backoff():
+    state = _state()
+    state.on_disconnect(None)
+    state.on_disconnect(None)
+    state.on_disconnect(None)
+    # >= not >: a connection lasting exactly stable_threshold must reset the
+    # count, so the disconnect itself is failure #1 and gets delays[0].
+    assert state.on_disconnect(connection_duration=60.0) == 10.0
+
+
 def test_jitter_bounds_delay_to_half_to_one_and_a_half_base():
     rng = random.Random(0)
     state = _state(jitter=True)
