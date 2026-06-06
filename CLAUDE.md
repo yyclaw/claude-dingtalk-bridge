@@ -13,7 +13,10 @@ Code turns and escalates risky operations back to the phone for approval.
 
 - `make setup` — create `.venv`, `pip install -e ".[dev]"`
 - `make config` — write `config.yaml` from the template if absent
-- `make test` — `pytest -q --cov` (with a branch-coverage summary)
+- `make test` — combined `pytest -q --cov` run, then a per-module isolated
+  branch-coverage gate (`scripts/coverage_isolated.py`): each `tests/test_<mod>.py`
+  re-run alone against only its own module, so incidental cross-module coverage
+  can't mask a weak per-file test. Anything below 100% fails the build.
 - `make start` — run the daemon in the foreground (logs to terminal)
 - `make daemon-*` — launchd lifecycle (install/uninstall/start/stop/restart/status)
 - `make logs-tail` — tail daemon logs; `make logs-web ARGS=...` — browser live-viewer

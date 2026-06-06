@@ -464,6 +464,36 @@ def test_run_registers_handler_then_shuts_down_on_signal(monkeypatch):
     assert len(client.handlers) == 1
 
 
+def test_run_formatter_prefixes_session_and_turn(monkeypatch):
+    import logging
+
+    from claude_dingtalk_bridge import log_context
+
+    _patch_run(monkeypatch)
+
+    async def fake_serve(client, orchestrator):
+        return
+
+    monkeypatch.setattr(daemon, "_serve", fake_serve)
+    daemon.run()
+    fmt = logging.getLogger().handlers[0].formatter
+    record = logging.LogRecord(
+        "claude_dingtalk_bridge.orchestrator", logging.INFO,
+        "f.py", 1, "hello", None, None,
+    )
+    try:
+        # Outside any turn: no session/turn prefix.
+        log_context.clear()
+        assert "session=" not in fmt.format(record)
+        # Inside a turn: the prefix is stamped between shortname and message.
+        log_context.set_session("abcdef123456")
+        log_context.set_turn(2)
+        out = fmt.format(record)
+        assert "session=abcdef12 turn=2 " in out
+    finally:
+        log_context.clear()
+
+
 def test_run_swallows_keyboard_interrupt(monkeypatch):
     # When client.start() raises KeyboardInterrupt, _drive_stream_client logs
     # and retries; on the second iteration it raises again. asyncio.run

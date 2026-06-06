@@ -358,6 +358,49 @@ def test_log_cache_usage_ignores_empty(caplog):
     assert caplog.text == ""
 
 
+def test_aggregate_model_usage_sums_camelcase_entries():
+    from claude_dingtalk_bridge.claude_runner import aggregate_model_usage
+
+    summed = aggregate_model_usage({
+        "claude-opus-4-7": {
+            "inputTokens": 10, "outputTokens": 20,
+            "cacheReadInputTokens": 100, "cacheCreationInputTokens": 200,
+        },
+        "claude-haiku-4-5": {
+            "inputTokens": 1, "outputTokens": 2,
+            "cacheReadInputTokens": 3, "cacheCreationInputTokens": 4,
+        },
+    })
+    # All cache creation lumps into the 1h bucket; 5m is always 0.
+    assert summed == {
+        "input_tokens": 11,
+        "output_tokens": 22,
+        "cache_read_input_tokens": 103,
+        "cache_creation": {
+            "ephemeral_1h_input_tokens": 204,
+            "ephemeral_5m_input_tokens": 0,
+        },
+    }
+
+
+def test_model_cache_breakdown_formats_tokens_and_hit_rate():
+    from claude_dingtalk_bridge.claude_runner import _model_cache_breakdown
+
+    out = _model_cache_breakdown({
+        "cacheReadInputTokens": 5000,
+        "cacheCreationInputTokens": 8000,
+        "inputTokens": 12,
+    })
+    # hit = 5000 / (5000 + 8000 + 12) = 38.4%
+    assert out == {"read": "5K", "creation": "8K", "hit": "38.4%"}
+
+
+def test_model_cache_breakdown_hit_na_when_no_prompt_tokens():
+    from claude_dingtalk_bridge.claude_runner import _model_cache_breakdown
+
+    assert _model_cache_breakdown({}) == {"read": "0", "creation": "0", "hit": "n/a"}
+
+
 def test_record_usage_accumulates_session_tokens():
     runner = ClaudeRunner()
     runner.record_usage("/p", {

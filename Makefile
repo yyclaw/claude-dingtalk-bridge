@@ -39,8 +39,9 @@ config: ## Create the config file from the template (if absent)
 	@# fixing the file in place whether it was just created or pre-existed.
 	@chmod 600 "$(CONFIG)"
 
-test: ## Run the unit tests with a branch-coverage summary
+test: ## Run the unit tests (combined run + per-module isolated coverage gate)
 	$(PYTEST) -q --cov
+	$(PY) scripts/coverage_isolated.py
 
 check: ## Smoke-check the Bash permission hook against a table of representative commands
 	$(PY) scripts/check_bash_permissions.py

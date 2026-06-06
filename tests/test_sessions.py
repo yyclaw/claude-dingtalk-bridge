@@ -1,8 +1,11 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 from claude_dingtalk_bridge.sessions import (
     format_session_list,
     is_uuid,
+    project_key_for_directory,
+    session_transcript_path,
 )
 
 
@@ -105,3 +108,11 @@ async def test_find_session_passes_args(monkeypatch):
     result = await sessions_mod.find_session("/tmp/proj", "the-id")
     assert result is None
     assert captured == {"session_id": "the-id", "directory": "/tmp/proj"}
+
+
+def test_session_transcript_path_follows_sdk_convention():
+    # Path is computed from the project key, not stat'd — so it's well-defined
+    # even before the JSONL file exists.
+    key = project_key_for_directory("/Users/dev/proj")
+    expected = Path.home() / ".claude" / "projects" / key / "abc123.jsonl"
+    assert session_transcript_path("/Users/dev/proj", "abc123") == expected

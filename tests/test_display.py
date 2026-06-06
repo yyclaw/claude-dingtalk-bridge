@@ -6,6 +6,7 @@ from claude_dingtalk_bridge.display import (
     format_cost,
     format_relative_time,
     format_size,
+    format_tokens,
     format_uptime,
     md_escape,
     short_model_name,
@@ -132,8 +133,29 @@ def test_collapse_inline_paths_noop_when_no_cwd_and_path_outside_home():
     assert collapse_inline_paths("ls /tmp/x", cwd="") == "ls /tmp/x"
 
 
+def test_collapse_inline_paths_without_cwd_falls_back_to_log_context():
+    # cwd=None → look up log_context (empty in a unit test), so the path block
+    # is skipped and only the home-collapse step runs.
+    assert collapse_inline_paths("ls /tmp/x") == "ls /tmp/x"
+
+
 def test_collapse_inline_paths_empty_string_unchanged():
     assert collapse_inline_paths("") == ""
+
+
+def test_format_tokens_compact_units():
+    assert format_tokens(0) == "0"
+    assert format_tokens(999) == "999"
+    assert format_tokens(1000) == "1K"
+    assert format_tokens(1500) == "1.5K"
+    assert format_tokens(45_000) == "45K"
+    assert format_tokens(1_000_000) == "1M"
+    assert format_tokens(1_500_000) == "1.5M"
+
+
+def test_display_path_home_root_renders_as_bare_tilde():
+    # A path equal to $HOME itself (not a child) collapses to "~".
+    assert display_path(Path.home()) == "~"
 
 
 def test_collapse_home_guards_against_empty_or_root_home(monkeypatch):
