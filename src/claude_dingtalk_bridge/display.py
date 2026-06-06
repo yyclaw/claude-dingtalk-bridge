@@ -93,6 +93,25 @@ def format_tokens(n: int) -> str:
     return str(n)
 
 
+def format_uptime(seconds: int) -> str:
+    """Render an elapsed duration as ``X days Y hours Z minutes``.
+
+    Sub-minute durations collapse to ``just now``; zero-valued components are
+    dropped (so a clean day reads ``1 day``, not ``1 day 0 hours 0 minutes``)
+    and units are singular/plural to match their count.
+    """
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    days, rem = divmod(minutes, 1440)
+    hours, mins = divmod(rem, 60)
+    parts = []
+    for value, unit in ((days, "day"), (hours, "hour"), (mins, "minute")):
+        if value:
+            parts.append(f"{value} {unit}" + ("s" if value != 1 else ""))
+    return " ".join(parts)
+
+
 def format_relative_time(epoch_ms: int, now_ms: int | None = None) -> str:
     """Render an epoch-ms timestamp as a phone-friendly relative time."""
     now = now_ms if now_ms is not None else int(time.time() * 1000)

@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .display import format_uptime
+
 LABEL = "com.claude-dingtalk-bridge"
 APP_NAME = "Claude DingTalk Bridge"
 APP_BUNDLE = Path.home() / "Applications" / f"{APP_NAME}.app"
@@ -256,6 +258,31 @@ def restart() -> None:
     _run(["launchctl", "kickstart", "-k", _service_target()])
 
 
+def _parse_etime(value: str) -> int:
+    """Parse a ps(1) ``etime`` string (``[[dd-]hh:]mm:ss``) into seconds."""
+    days = 0
+    if "-" in value:
+        day_str, value = value.split("-", 1)
+        days = int(day_str)
+    fields = [int(f) for f in value.split(":")]
+    while len(fields) < 3:
+        fields.insert(0, 0)
+    hours, minutes, seconds = fields
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _process_uptime_seconds(pid: str) -> int | None:
+    """Elapsed seconds since ``pid`` started, or None if it can't be read."""
+    result = _run(["ps", "-o", "etime=", "-p", str(pid)], check=False, capture=True)
+    etime = result.stdout.strip()
+    if result.returncode != 0 or not etime:
+        return None
+    try:
+        return _parse_etime(etime)
+    except ValueError:
+        return None
+
+
 def status() -> str:
     if not _helper_path().exists():
         return "not installed"
@@ -263,11 +290,21 @@ def status() -> str:
     result = _run(["launchctl", "print", _service_target()], check=False, capture=True)
     if result.returncode != 0:
         return f"registered: {registration}; not loaded"
+    state = None
+    pid = None
     for line in result.stdout.splitlines():
         stripped = line.strip()
-        if stripped.startswith("state ="):
-            return f"registered: {registration}; {stripped}"
-    return f"registered: {registration}; loaded"
+        # Keep the first (top-level) state; nested sub-services repeat the key.
+        if state is None and stripped.startswith("state ="):
+            state = stripped
+        elif pid is None and stripped.startswith("pid ="):
+            pid = stripped.split("=", 1)[1].strip()
+    base = f"registered: {registration}; {state}" if state else f"registered: {registration}; loaded"
+    if pid:
+        seconds = _process_uptime_seconds(pid)
+        if seconds is not None:
+            base += f"; up {format_uptime(seconds)}"
+    return base
 
 
 def uninstall() -> None:

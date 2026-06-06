@@ -204,11 +204,28 @@ def test_start_bootstraps_when_not_loaded(tmp_path, monkeypatch):
     assert run.call_args[0][0][1] == "bootstrap"
 
 
+def test_start_raises_when_not_loaded_and_plist_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(launchd, "_agent_plist_path", lambda: tmp_path / "missing.plist")
+    with patch.object(launchd, "_is_loaded", return_value=False), \
+         patch.object(launchd, "_run") as run:
+        with pytest.raises(launchd.LaunchdError, match="not installed"):
+            launchd.start()
+    run.assert_not_called()
+
+
 def test_stop_boots_out_when_loaded():
     with patch.object(launchd, "_is_loaded", return_value=True), \
          patch.object(launchd, "_run") as run:
         launchd.stop()
     assert run.call_args[0][0][1] == "bootout"
+
+
+def test_stop_raises_when_not_loaded():
+    with patch.object(launchd, "_is_loaded", return_value=False), \
+         patch.object(launchd, "_run") as run:
+        with pytest.raises(launchd.LaunchdError, match="nothing to stop"):
+            launchd.stop()
+    run.assert_not_called()
 
 
 def test_restart_kickstarts_with_kill_flag():
@@ -262,6 +279,55 @@ def test_status_reports_loaded_when_no_state_line(tmp_path, monkeypatch):
     with patch.object(launchd, "_run_helper", return_value="enabled"), \
          patch.object(launchd, "_run", return_value=_proc(returncode=0, stdout="no state here")):
         assert launchd.status() == "registered: enabled; loaded"
+
+
+def test_status_appends_uptime_when_pid_present(tmp_path, monkeypatch):
+    helper = tmp_path / "helper"
+    helper.write_text("x")
+    monkeypatch.setattr(launchd, "_helper_path", lambda: helper)
+    # The nested `state = active` lines must not shadow the top-level state.
+    printout = "service = {\n\tstate = running\n\tpid = 4321\n\tendpoints = {\n\t\tstate = active\n\t}\n}"
+    with patch.object(launchd, "_run_helper", return_value="enabled"), \
+         patch.object(launchd, "_run", return_value=_proc(returncode=0, stdout=printout)), \
+         patch.object(launchd, "_process_uptime_seconds", return_value=90061) as uptime:
+        assert (
+            launchd.status()
+            == "registered: enabled; state = running; up 1 day 1 hour 1 minute"
+        )
+    uptime.assert_called_once_with("4321")
+
+
+def test_status_omits_uptime_when_lookup_fails(tmp_path, monkeypatch):
+    helper = tmp_path / "helper"
+    helper.write_text("x")
+    monkeypatch.setattr(launchd, "_helper_path", lambda: helper)
+    printout = "service = {\n\tstate = running\n\tpid = 4321\n}"
+    with patch.object(launchd, "_run_helper", return_value="enabled"), \
+         patch.object(launchd, "_run", return_value=_proc(returncode=0, stdout=printout)), \
+         patch.object(launchd, "_process_uptime_seconds", return_value=None):
+        assert launchd.status() == "registered: enabled; state = running"
+
+
+def test_parse_etime_handles_all_field_shapes():
+    assert launchd._parse_etime("05:47") == 5 * 60 + 47
+    assert launchd._parse_etime("01:02:03") == 3723
+    assert launchd._parse_etime("2-03:04:05") == 2 * 86400 + 3 * 3600 + 4 * 60 + 5
+
+
+def test_process_uptime_seconds_reads_ps_etime():
+    with patch.object(launchd, "_run", return_value=_proc(returncode=0, stdout=" 01:02:03 \n")):
+        assert launchd._process_uptime_seconds("4321") == 3723
+
+
+def test_process_uptime_seconds_returns_none_when_ps_fails():
+    with patch.object(launchd, "_run", return_value=_proc(returncode=1)):
+        assert launchd._process_uptime_seconds("4321") is None
+
+
+def test_process_uptime_seconds_returns_none_on_unparseable_etime():
+    # ps succeeded but handed back something that isn't an etime — never crash.
+    with patch.object(launchd, "_run", return_value=_proc(returncode=0, stdout="garbage\n")):
+        assert launchd._process_uptime_seconds("4321") is None
 
 
 def test_uninstall_unregisters_and_removes_bundle(tmp_path, monkeypatch):

@@ -6,6 +6,7 @@ from claude_dingtalk_bridge.display import (
     format_cost,
     format_relative_time,
     format_size,
+    format_uptime,
     md_escape,
     short_model_name,
 )
@@ -18,6 +19,31 @@ def test_relative_time_buckets():
     assert format_relative_time(now - 7_200_000, now) == "2h ago"
     assert format_relative_time(now - 86_400_000, now) == "yesterday"
     assert format_relative_time(now - 3 * 86_400_000, now) == "3d ago"
+
+
+def test_format_uptime_under_a_minute_is_just_now():
+    assert format_uptime(0) == "just now"
+    assert format_uptime(59) == "just now"
+
+
+def test_format_uptime_singular_and_plural():
+    assert format_uptime(60) == "1 minute"
+    assert format_uptime(120) == "2 minutes"
+    assert format_uptime(3600) == "1 hour"
+    assert format_uptime(7200) == "2 hours"
+    assert format_uptime(86400) == "1 day"
+    assert format_uptime(2 * 86400) == "2 days"
+
+
+def test_format_uptime_drops_zero_components():
+    # 1 day + 5 minutes, no hours
+    assert format_uptime(86400 + 300) == "1 day 5 minutes"
+    # 2 hours 3 minutes
+    assert format_uptime(2 * 3600 + 180) == "2 hours 3 minutes"
+    # full chain, all plural
+    assert format_uptime(3 * 86400 + 4 * 3600 + 5 * 60 + 30) == "3 days 4 hours 5 minutes"
+    # seconds in the trailing minute are floored away
+    assert format_uptime(3661) == "1 hour 1 minute"
 
 
 def test_md_escape_neutralizes_special_chars():
