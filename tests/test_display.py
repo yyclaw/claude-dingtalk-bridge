@@ -26,24 +26,24 @@ def test_format_uptime_under_a_minute_is_just_now():
     assert format_uptime(59) == "just now"
 
 
-def test_format_uptime_singular_and_plural():
-    assert format_uptime(60) == "1 minute"
-    assert format_uptime(120) == "2 minutes"
-    assert format_uptime(3600) == "1 hour"
-    assert format_uptime(7200) == "2 hours"
-    assert format_uptime(86400) == "1 day"
-    assert format_uptime(2 * 86400) == "2 days"
+def test_format_uptime_compact_units():
+    assert format_uptime(60) == "1m"
+    assert format_uptime(120) == "2m"
+    assert format_uptime(3600) == "1h"
+    assert format_uptime(7200) == "2h"
+    assert format_uptime(86400) == "1d"
+    assert format_uptime(2 * 86400) == "2d"
 
 
 def test_format_uptime_drops_zero_components():
     # 1 day + 5 minutes, no hours
-    assert format_uptime(86400 + 300) == "1 day 5 minutes"
+    assert format_uptime(86400 + 300) == "1d 5m"
     # 2 hours 3 minutes
-    assert format_uptime(2 * 3600 + 180) == "2 hours 3 minutes"
-    # full chain, all plural
-    assert format_uptime(3 * 86400 + 4 * 3600 + 5 * 60 + 30) == "3 days 4 hours 5 minutes"
+    assert format_uptime(2 * 3600 + 180) == "2h 3m"
+    # full chain
+    assert format_uptime(3 * 86400 + 4 * 3600 + 5 * 60 + 30) == "3d 4h 5m"
     # seconds in the trailing minute are floored away
-    assert format_uptime(3661) == "1 hour 1 minute"
+    assert format_uptime(3661) == "1h 1m"
 
 
 def test_md_escape_neutralizes_special_chars():

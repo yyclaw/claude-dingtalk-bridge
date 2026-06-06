@@ -289,21 +289,21 @@ def status() -> str:
     registration = _run_helper("status")
     result = _run(["launchctl", "print", _service_target()], check=False, capture=True)
     if result.returncode != 0:
-        return f"registered: {registration}; not loaded"
+        return f"login item: {registration}; state: not loaded"
     state = None
     pid = None
     for line in result.stdout.splitlines():
         stripped = line.strip()
         # Keep the first (top-level) state; nested sub-services repeat the key.
         if state is None and stripped.startswith("state ="):
-            state = stripped
+            state = stripped.split("=", 1)[1].strip()
         elif pid is None and stripped.startswith("pid ="):
             pid = stripped.split("=", 1)[1].strip()
-    base = f"registered: {registration}; {state}" if state else f"registered: {registration}; loaded"
+    base = f"login item: {registration}; state: {state or 'loaded'}"
     if pid:
         seconds = _process_uptime_seconds(pid)
         if seconds is not None:
-            base += f"; up {format_uptime(seconds)}"
+            base += f"; up: {format_uptime(seconds)}"
     return base
 
 

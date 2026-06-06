@@ -94,11 +94,11 @@ def format_tokens(n: int) -> str:
 
 
 def format_uptime(seconds: int) -> str:
-    """Render an elapsed duration as ``X days Y hours Z minutes``.
+    """Render an elapsed duration as ``Xd Yh Zm``.
 
     Sub-minute durations collapse to ``just now``; zero-valued components are
-    dropped (so a clean day reads ``1 day``, not ``1 day 0 hours 0 minutes``)
-    and units are singular/plural to match their count.
+    dropped (so a clean day reads ``1d``, not ``1d 0h 0m``). The compact
+    single-letter units sidestep singular/plural agreement.
     """
     if seconds < 60:
         return "just now"
@@ -106,9 +106,9 @@ def format_uptime(seconds: int) -> str:
     days, rem = divmod(minutes, 1440)
     hours, mins = divmod(rem, 60)
     parts = []
-    for value, unit in ((days, "day"), (hours, "hour"), (mins, "minute")):
+    for value, unit in ((days, "d"), (hours, "h"), (mins, "m")):
         if value:
-            parts.append(f"{value} {unit}" + ("s" if value != 1 else ""))
+            parts.append(f"{value}{unit}")
     return " ".join(parts)
 
 

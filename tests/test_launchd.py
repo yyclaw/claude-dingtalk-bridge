@@ -259,7 +259,7 @@ def test_status_reports_registered_but_not_loaded(tmp_path, monkeypatch):
     monkeypatch.setattr(launchd, "_helper_path", lambda: helper)
     with patch.object(launchd, "_run_helper", return_value="enabled"), \
          patch.object(launchd, "_run", return_value=_proc(returncode=1)):
-        assert launchd.status() == "registered: enabled; not loaded"
+        assert launchd.status() == "login item: enabled; state: not loaded"
 
 
 def test_status_reports_running_state_from_launchctl(tmp_path, monkeypatch):
@@ -269,7 +269,7 @@ def test_status_reports_running_state_from_launchctl(tmp_path, monkeypatch):
     printout = "service = {\n\tstate = running\n}"
     with patch.object(launchd, "_run_helper", return_value="enabled"), \
          patch.object(launchd, "_run", return_value=_proc(returncode=0, stdout=printout)):
-        assert launchd.status() == "registered: enabled; state = running"
+        assert launchd.status() == "login item: enabled; state: running"
 
 
 def test_status_reports_loaded_when_no_state_line(tmp_path, monkeypatch):
@@ -278,7 +278,7 @@ def test_status_reports_loaded_when_no_state_line(tmp_path, monkeypatch):
     monkeypatch.setattr(launchd, "_helper_path", lambda: helper)
     with patch.object(launchd, "_run_helper", return_value="enabled"), \
          patch.object(launchd, "_run", return_value=_proc(returncode=0, stdout="no state here")):
-        assert launchd.status() == "registered: enabled; loaded"
+        assert launchd.status() == "login item: enabled; state: loaded"
 
 
 def test_status_appends_uptime_when_pid_present(tmp_path, monkeypatch):
@@ -292,7 +292,7 @@ def test_status_appends_uptime_when_pid_present(tmp_path, monkeypatch):
          patch.object(launchd, "_process_uptime_seconds", return_value=90061) as uptime:
         assert (
             launchd.status()
-            == "registered: enabled; state = running; up 1 day 1 hour 1 minute"
+            == "login item: enabled; state: running; up: 1d 1h 1m"
         )
     uptime.assert_called_once_with("4321")
 
@@ -305,7 +305,7 @@ def test_status_omits_uptime_when_lookup_fails(tmp_path, monkeypatch):
     with patch.object(launchd, "_run_helper", return_value="enabled"), \
          patch.object(launchd, "_run", return_value=_proc(returncode=0, stdout=printout)), \
          patch.object(launchd, "_process_uptime_seconds", return_value=None):
-        assert launchd.status() == "registered: enabled; state = running"
+        assert launchd.status() == "login item: enabled; state: running"
 
 
 def test_parse_etime_handles_all_field_shapes():
