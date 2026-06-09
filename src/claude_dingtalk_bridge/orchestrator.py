@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import secrets
 from typing import Awaitable, Callable
 
@@ -96,20 +97,54 @@ def _geo_slow_notice_delay(timeout_seconds: int) -> float | None:
 MODEL_NAMES: tuple[str, ...] = ("opus", "sonnet", "haiku")
 
 
-def _looks_like_narration(text: str) -> bool:
-    """A text block ending in colon is almost always pre-tool intent narration.
+# Discourse markers that open a "going-to-do-X" sentence. A text block whose
+# every sentence opens with one of these reports no outcome — it's pure
+# forward-looking narration ("Now the ThemeProvider.", "Let me read the
+# config."), the bulk of the noise on the phone in brief mode. Kept narrow on
+# purpose: pure sequencers (next/then/first/also/finally) carry no tool intent
+# and routinely open genuine answer prose ("First, generate a key. Then copy
+# it.") — including them dropped real replies, so they're out. Each apostrophe
+# accepts the typographic variant (U+2019) the model often emits.
+_FORWARD_INTENT_RE = re.compile(
+    r"(?i)^(?:now|let me|let['’]s|lets|i['’]ll|i will|"
+    r"i['’]m going to|i am going to)\b"
+)
+# Split on sentence terminators, but treat an ASCII `.!?` as a boundary only
+# when whitespace or end-of-string follows — otherwise the dot in `main.tsx`
+# or `index.html` falsely splits a single "Now wire X into main.tsx" sentence,
+# leaving a non-forward fragment that wrongly keeps the block. CJK terminators
+# and newlines always split (no intra-word dots to worry about).
+_SENTENCE_SPLIT_RE = re.compile(r"[。！？\n]+|[.!?]+(?=\s|$)")
 
-    Empirically every "now I'll do X" line the assistant emits between tool
-    calls ends in `:` (English) or `：` (Chinese), while content/reply text
-    ends in a sentence terminator. This is a deliberate heuristic, not a hard
-    guarantee — verbose mode bypasses it and ResultMessage acts as a safety
-    net when an entire turn was filtered out.
 
-    Trailing markdown emphasis (``**bold:**``, ``_italic:_``) is stripped
-    before the check — otherwise a bolded narration line ends in ``**`` and
-    slips past, which historically reached the phone.
+def _is_progress_filler(text: str) -> bool:
+    """True when a text block carries forward-looking narration worth dropping
+    in brief mode — cutting per-turn phone volume while leaving 📋 Tasks and
+    subagent notices as the progress signal.
+
+    Two drop signals, both heuristic (verbose mode bypasses them; the
+    ResultMessage fallback still surfaces the final reply if a whole turn
+    filtered out):
+
+    1. Ends in a colon (``:`` / ``：``) — pre-list / pre-tool narration
+       ("Here's the plan:"). Trailing markdown emphasis (``**bold:**``) is
+       stripped first, else a bolded line ends in ``**`` and slips past.
+    2. *Any* sentence opens with a forward-intent marker (Now / Let me /
+       I'll …). Even a leading finding ("Build succeeds. Let me
+       verify…", "The image shows X. Let me find Y.") drops — those
+       observation+intent patterns are mostly intent dressing, not the
+       milestone signal. A pure-result block with no forward tail
+       ("All four changes are implemented, tested, and verified.") still
+       passes through.
     """
-    return text.rstrip().rstrip("*_").endswith((":", "："))
+    stripped = text.rstrip().rstrip("*_")
+    if stripped.endswith((":", "：")):
+        return True
+    return any(
+        _FORWARD_INTENT_RE.match(cleaned)
+        for s in _SENTENCE_SPLIT_RE.split(stripped)
+        if (cleaned := s.strip().lstrip("*_`-# ").strip())
+    )
 
 
 def _fmt_usage(duration_ms: int, total_tokens: int) -> str:
@@ -1102,12 +1137,12 @@ class Orchestrator:
         if self._turn_cancelled:
             return
         if isinstance(event, TextEvent):
-            # Heuristic: a text block ending in `:` / `：` is pre-tool narration
-            # ("now I'll do X:"). Content text ends in a sentence terminator
-            # (`.`, `。`, `!`, `?` …). Drop narration in non-verbose mode; the
-            # fallback at ResultEvent still surfaces the SDK's final `result`
-            # if the entire turn was narration-only.
-            if _looks_like_narration(event.text) and not self._verbose:
+            # Brief mode drops pure forward-looking narration ("Now the X.",
+            # "Let me read Y.") — the bulk of per-turn message volume — while
+            # keeping any block that reports a finding or result. Verbose mode
+            # shows everything; the ResultEvent fallback still surfaces the
+            # SDK's final `result` if a whole turn filtered out.
+            if _is_progress_filler(event.text) and not self._verbose:
                 return
             self._turn_sent_text = True
             await self._send_markdown(event.text)

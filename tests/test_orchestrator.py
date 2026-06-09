@@ -1713,6 +1713,128 @@ async def test_result_event_fallback_fires_when_all_text_was_narration():
     assert any("Here is the actual answer" in m for m in sent)
 
 
+async def test_forward_intent_narration_dropped_in_brief_mode():
+    # The real-world leak: period-terminated "going to do X" lines slipped past
+    # the old colon-only check and flooded the phone. Every sentence here opens
+    # with a forward-intent marker, so brief mode drops them.
+    runner = FakeRunner()
+    runner.script = [
+        TextEvent("Now the ThemeProvider."),
+        TextEvent("Let me read the key files in parallel."),
+        TextEvent("I'll wrap App renders in ThemeProvider via a helper."),
+        TextEvent("Now let me run the frontend tests and typecheck."),
+    ]
+    orchestrator, runner, sent = build(runner)
+    assert orchestrator._verbose is False
+    await orchestrator.handle_message("go", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert not any("ThemeProvider" in m for m in sent)
+    assert not any("key files" in m for m in sent)
+    assert not any("wrap App renders" in m for m in sent)
+    assert not any("frontend tests" in m for m in sent)
+
+
+async def test_observation_with_forward_tail_dropped():
+    # A leading observation followed by "Let me X" / "Now I'll Y" is mostly
+    # intent dressing — drop the whole block. The 📋 Tasks checklist and
+    # subagent notices are the progress signal in brief mode, not prose.
+    runner = FakeRunner()
+    runner.script = [
+        # Image leak (bubble 1): observation then two forward intents.
+        TextEvent(
+            "I can see DingTalk messages where the daemon is pushing Japanese "
+            "intermediate narration to the phone. Let me investigate where "
+            "Japanese could come from. Let me look at the prompt construction path."
+        ),
+        # Image leak (bubble 2): observation then "Let me find this".
+        TextEvent(
+            "The image shows a previous session where the daemon was pushing "
+            "Japanese narrations. Let me find this in the logs."
+        ),
+        # Milestone + forward tail also dropped under the stricter rule.
+        TextEvent("Task 1 wired up. Now the Tooltip component."),
+        TextEvent("Build succeeds. Let me verify the compiled CSS."),
+    ]
+    orchestrator, runner, sent = build(runner)
+    assert orchestrator._verbose is False
+    await orchestrator.handle_message("go", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert not any("Japanese" in m for m in sent)
+    assert not any("image shows" in m for m in sent)
+    assert not any("Task 1 wired up" in m for m in sent)
+    assert not any("Build succeeds" in m for m in sent)
+
+
+async def test_pure_result_block_without_forward_tail_kept():
+    # Symmetric guard: a block that reports an outcome with no "Let me X" /
+    # "Now I'll Y" tail must still reach the phone — it's the final reply.
+    runner = FakeRunner()
+    runner.script = [
+        TextEvent(
+            "All four changes are implemented, tested, and verified live in "
+            "the browser."
+        ),
+    ]
+    orchestrator, runner, sent = build(runner)
+    assert orchestrator._verbose is False
+    await orchestrator.handle_message("go", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert any("verified live" in m for m in sent)
+
+
+async def test_forward_intent_narration_kept_in_verbose_mode():
+    # Verbose bypasses the filler filter — full progress is the point.
+    runner = FakeRunner()
+    runner.script = [TextEvent("Now the ThemeProvider.")]
+    orchestrator, runner, sent = build(runner)
+    orchestrator._verbose = True
+    await orchestrator.handle_message("go", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert any("ThemeProvider" in m for m in sent)
+
+
+def test_is_progress_filler_ignores_dots_inside_filenames():
+    # The dot in `main.tsx` / `index.html` must not split the sentence — else
+    # a non-forward fragment ("tsx and add …") wrongly keeps a forward block.
+    assert orch_mod._is_progress_filler(
+        "Now wire ThemeProvider into main.tsx and add a script in index.html."
+    ) is True
+    assert orch_mod._is_progress_filler(
+        "Now use Tooltip in Card.tsx, replacing the native title."
+    ) is True
+
+
+def test_is_progress_filler_keeps_punctuation_only_block():
+    # A block that splits into no real sentences (pure punctuation) reports
+    # nothing to match against — default to keeping it rather than dropping.
+    assert orch_mod._is_progress_filler("...") is False
+    assert orch_mod._is_progress_filler("Let me check.") is True
+    assert orch_mod._is_progress_filler("Done.") is False
+
+
+def test_is_progress_filler_keeps_genuine_sequenced_prose():
+    # Pure sequencers open ordinary answer prose, not tool intent — a complete,
+    # self-contained reply must survive even when a sentence starts with one.
+    assert orch_mod._is_progress_filler(
+        "Here are the steps. First, generate a key with ssh-keygen. "
+        "Then copy it to the server. Finally test the connection."
+    ) is False
+    assert orch_mod._is_progress_filler(
+        "Deleting that directory is safe. Also, a copy exists in git history."
+    ) is False
+    assert orch_mod._is_progress_filler(
+        "Renamed the functions and the tests pass. Next, run make lint."
+    ) is False
+
+
+def test_is_progress_filler_matches_typographic_apostrophe():
+    # The model often emits a curly apostrophe (U+2019); "I’ll"/"let’s" must
+    # drop the same as their ASCII forms, else the narration leaks to the phone.
+    assert orch_mod._is_progress_filler("I’ll check the config.") is True
+    assert orch_mod._is_progress_filler("Let’s read the file.") is True
+    assert orch_mod._is_progress_filler("I’m going to run the tests.") is True
+
+
 async def test_emit_drops_events_after_a_turn_is_cancelled():
     # A stopped/cleared turn keeps unwinding; _emit must swallow whatever it
     # still produces (e.g. a stale background-drain timeout).
