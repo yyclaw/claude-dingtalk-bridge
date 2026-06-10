@@ -303,7 +303,7 @@ def status() -> str:
     if pid:
         seconds = _process_uptime_seconds(pid)
         if seconds is not None:
-            base += f"; up: {format_uptime(seconds)}"
+            base += f"; uptime: {format_uptime(seconds)}"
     return base
 
 

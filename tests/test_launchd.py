@@ -292,7 +292,7 @@ def test_status_appends_uptime_when_pid_present(tmp_path, monkeypatch):
          patch.object(launchd, "_process_uptime_seconds", return_value=90061) as uptime:
         assert (
             launchd.status()
-            == "login item: enabled; state: running; up: 1d 1h 1m"
+            == "login item: enabled; state: running; uptime: 1d 1h 1m"
         )
     uptime.assert_called_once_with("4321")
 
