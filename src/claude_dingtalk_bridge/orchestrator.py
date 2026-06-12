@@ -1096,9 +1096,15 @@ class Orchestrator:
                     if slow_notice is not None:
                         slow_notice.cancel()
                 if not check.ok:
-                    await self._send(
-                        f"{check.detail}\n⚠️ Turn skipped — fix the network and resend."
-                    )
+                    # Guard the skip notice: a transient blip here must not fall
+                    # through to the outer handler, which would relabel a clean
+                    # geo skip as "Turn aborted" and bury check.detail's guidance.
+                    try:
+                        await self._send(
+                            f"{check.detail}\n⚠️ Turn skipped — fix the network and resend."
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Failed to send geo-skip notice")
                     return
                 geo_note = f"\n\n{check.detail}"
             if self._dry_run:
@@ -1120,7 +1126,25 @@ class Orchestrator:
                 await self._runner.run_turn(project.path, prompt, self._emit)
             except Exception as exc:  # noqa: BLE001 - surface any failure to phone
                 logger.exception("Task failed")
-                await self._send(f"⚠️ Task failed\n{exc}")
+                # Guard the notice send: if it blips, the failure must not fall
+                # through to the outer handler, which would relabel a genuine
+                # runner failure as "Turn aborted" with the transport error.
+                try:
+                    await self._send(f"⚠️ Task failed\n{exc}")
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to notify phone of failed task")
+        except Exception as exc:  # noqa: BLE001
+            # _run is a fire-and-forget task; an exception escaping it surfaces
+            # only as asyncio's "Task exception was never retrieved" and drops
+            # the turn silently. The pre-run sends (geo notice, banner) can blip
+            # on a transient transport failure — catch here so one bad send
+            # never kills the task. The notice is best-effort: if the transport
+            # is down it'll fail too, so swallow that secondary failure.
+            logger.exception("Turn aborted before completion")
+            try:
+                await self._send(f"⚠️ Turn aborted\n{exc}")
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to notify phone of aborted turn")
         finally:
             await self._drain_queue()
 
@@ -1211,9 +1235,15 @@ class Orchestrator:
         # before the "Task stopped" ack.
         if self._turn_cancelled:
             return
-        await self._send(
-            "⏳ Checking geo location — this is taking a moment, please wait."
-        )
+        # Fire-and-forget timer task: a transient _send blip here would only
+        # surface as asyncio's unretrieved-task exception. Swallow it — a lost
+        # reassurance notice is harmless.
+        try:
+            await self._send(
+                "⏳ Checking geo location — this is taking a moment, please wait."
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to send geo slow notice")
 
     def _cancel_pending_notice(self) -> None:
         if self._pending_notice_task is not None:
@@ -1252,10 +1282,15 @@ class Orchestrator:
             return
         n = len(truly_pending)
         plural = "s" if n > 1 else ""
-        await self._send(
-            f"⏳ {n} background agent{plural} still running — "
-            "I'll push the result here when it finishes."
-        )
+        # Same fire-and-forget timer hazard as _geo_slow_notice — swallow a
+        # transient _send blip so it can't escape the unretrieved task.
+        try:
+            await self._send(
+                f"⏳ {n} background agent{plural} still running — "
+                "I'll push the result here when it finishes."
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to send pending-agent notice")
 
     async def request_permission(
         self, tool_name: str, tool_input: dict, project_path: str | None = None

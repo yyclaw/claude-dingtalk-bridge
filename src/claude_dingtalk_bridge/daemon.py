@@ -443,6 +443,12 @@ def _open_connection(client) -> dict | None:
             headers=headers,
             data=body,
             timeout=_OPEN_CONNECTION_TIMEOUT,
+            # Bypass the ambient/system proxy: requests honors the macOS system
+            # proxy (and http_proxy env) by default, but DingTalk is reached
+            # directly — only Claude's task traffic and the geo check ride the
+            # geo proxy. This mirrors _disable_websocket_proxy for the WS that
+            # this very call bootstraps.
+            proxies={"http": None, "https": None},
         )
         resp.raise_for_status()
         return resp.json()
@@ -533,10 +539,16 @@ async def _auto_update_check(orchestrator: Orchestrator) -> None:
         logger.warning("auto update check failed", exc_info=True)
         return
     if status.behind:
-        await orchestrator.notify(
-            "🔔 An update for claude-dingtalk-bridge is available — "
-            "send `/update` to apply."
-        )
+        # The notify send can blip on a transient transport failure; let it
+        # stay silent like the fetch errors above rather than escape into
+        # _auto_update_loop's while-True and kill the loop until next restart.
+        try:
+            await orchestrator.notify(
+                "🔔 An update for claude-dingtalk-bridge is available — "
+                "send `/update` to apply."
+            )
+        except Exception:  # noqa: BLE001 - a bad nudge must not kill the loop
+            logger.warning("auto update notify failed", exc_info=True)
 
 
 async def _auto_update_loop(orchestrator: Orchestrator) -> None:

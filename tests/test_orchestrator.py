@@ -587,6 +587,32 @@ async def test_geo_failure_skips_turn():
     assert any("skipped" in m and "HK" in m for m in sent)
 
 
+async def test_geo_skip_notice_send_blip_does_not_relabel_as_aborted():
+    # When the geo check fails AND the "Turn skipped" notice send itself blips,
+    # the send failure must be swallowed in place — not fall through to the
+    # outer handler, which would relabel a clean geo skip as "Turn aborted"
+    # carrying the transport error and burying check.detail's network guidance.
+    async def geo_check():
+        from claude_dingtalk_bridge.geo import GeoCheck
+        return GeoCheck(ok=False, detail="📍 IP: 45.8.1.1\n❌ IP location: HK (expected: US)")
+
+    orchestrator, runner, sent = build(geo_check=geo_check)
+
+    real_send = orchestrator._send
+
+    async def blip_on_skip_notice(text: str) -> None:
+        if "skipped" in text:
+            raise ConnectionError("proxy blip")
+        await real_send(text)
+
+    orchestrator._send = blip_on_skip_notice
+    await orchestrator.handle_message("do work", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    assert runner.turns == []
+    # The blip stayed contained: no misleading "Turn aborted" leaked through.
+    assert not any("Turn aborted" in m for m in sent)
+
+
 async def test_geo_failure_with_live_timer_cancels_it(monkeypatch):
     """Failure path while the slow-notice timer is live (delay not None): the
     timer is cancelled in finally before the 'Turn skipped' notice, and no
@@ -2001,6 +2027,84 @@ async def test_run_surfaces_a_failed_turn():
     await orchestrator.handle_message("go", AUTHORIZED)
     await _wait_idle(orchestrator)
     assert any("Task failed" in m and "turn blew up" in m for m in sent)
+
+
+async def test_failed_task_notice_send_blip_does_not_relabel_as_aborted():
+    # When run_turn fails AND the "Task failed" notice send itself blips, the
+    # send failure must be swallowed in place — not fall through to the outer
+    # handler, which would relabel a genuine runner failure as "Turn aborted"
+    # carrying the transport error instead of the real one.
+    runner = FakeRunner()
+
+    async def failing_run_turn(project_path, prompt, emit):
+        raise RuntimeError("turn blew up")
+
+    runner.run_turn = failing_run_turn
+    orchestrator, runner, sent = build(runner)
+
+    real_send = orchestrator._send
+
+    async def send_blip_on_failure_notice(text: str) -> None:
+        if "Task failed" in text:
+            raise ConnectionError("proxy blip")
+        await real_send(text)
+
+    orchestrator._send = send_blip_on_failure_notice
+
+    await orchestrator.handle_message("go", AUTHORIZED)
+    await _wait_idle(orchestrator)
+    # The blip stayed contained: no misleading "Turn aborted" leaked through.
+    assert not any("Turn aborted" in m for m in sent)
+
+
+async def test_run_swallows_send_failure_before_turn():
+    # A transient transport blip on the task-started banner (the access-token
+    # POST failing through the proxy) used to escape the fire-and-forget _run
+    # task — asyncio logged an unretrieved-task exception and the turn vanished
+    # with no phone feedback. _run must never let one bad send kill the task,
+    # even when the error notice itself can't be delivered.
+    orchestrator, runner, sent = build()
+
+    async def always_failing_send(text: str) -> None:
+        raise ConnectionError("proxy blip")
+
+    orchestrator._send = always_failing_send
+    orchestrator._send_markdown = always_failing_send
+
+    await orchestrator.handle_message("go", AUTHORIZED)
+    task = orchestrator._task
+    await asyncio.gather(task, return_exceptions=True)
+    assert task.exception() is None
+
+
+async def test_geo_slow_notice_swallows_send_failure():
+    # The slow-notice runs as a fire-and-forget timer task whose exception is
+    # never retrieved — a transient transport blip on its reassurance _send
+    # must not escape it.
+    orchestrator, runner, sent = build()
+
+    async def failing_send(text: str) -> None:
+        raise ConnectionError("proxy blip")
+
+    orchestrator._send = failing_send
+    orchestrator._turn_cancelled = False
+    await orchestrator._geo_slow_notice(0)
+
+
+async def test_delayed_pending_notice_swallows_send_failure(monkeypatch):
+    # Same fire-and-forget timer hazard for the "background agent still
+    # running" reassurance notice.
+    monkeypatch.setattr(orch_mod, "_PENDING_NOTICE_DELAY", 0)
+    orchestrator, runner, sent = build()
+    orchestrator._pending_tasks = {"t1"}
+    orchestrator._acknowledged_tasks = set()
+    orchestrator._turn_cancelled = False
+
+    async def failing_send(text: str) -> None:
+        raise ConnectionError("proxy blip")
+
+    orchestrator._send = failing_send
+    await orchestrator._delayed_pending_notice()
 
 
 async def test_new_prompt_preempts_drain_phase_without_queueing():

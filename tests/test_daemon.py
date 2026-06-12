@@ -842,9 +842,10 @@ def test_open_connection_posts_with_timeout_and_returns_json(monkeypatch):
         def json(self):
             return {"endpoint": "wss://gw", "ticket": "tkt"}
 
-    def fake_post(url, headers, data, timeout):
+    def fake_post(url, headers, data, timeout, proxies=None):
         captured["url"] = url
         captured["timeout"] = timeout
+        captured["proxies"] = proxies
         captured["body"] = _json.loads(data)
         return _Resp()
 
@@ -856,6 +857,9 @@ def test_open_connection_posts_with_timeout_and_returns_json(monkeypatch):
     assert result == {"endpoint": "wss://gw", "ticket": "tkt"}
     # The whole point of this wrapper: a real timeout, not the SDK's None.
     assert captured["timeout"] == daemon._OPEN_CONNECTION_TIMEOUT
+    # The gateway open must bypass the ambient/system proxy — DingTalk is
+    # reached directly (only Claude's task traffic rides the geo proxy).
+    assert captured["proxies"] == {"http": None, "https": None}
     assert captured["body"]["clientId"] == "cid"
     assert captured["body"]["clientSecret"] == "csec"
     assert {"type": "CALLBACK", "topic": "topic-a"} in captured["body"]["subscriptions"]
@@ -875,7 +879,7 @@ def test_open_connection_subscribes_to_event_topic_when_required(monkeypatch):
         def json(self):
             return {"endpoint": "wss://gw", "ticket": "tkt"}
 
-    def fake_post(url, headers, data, timeout):
+    def fake_post(url, headers, data, timeout, proxies=None):
         captured["body"] = _json.loads(data)
         return _Resp()
 
@@ -914,7 +918,9 @@ def test_open_connection_returns_none_on_http_error(monkeypatch):
             return {}
 
     monkeypatch.setattr(
-        daemon.requests, "post", lambda url, headers, data, timeout: _Resp()
+        daemon.requests,
+        "post",
+        lambda url, headers, data, timeout, proxies=None: _Resp(),
     )
     client = _FakeOpenClient(callbacks=["x"], event_required=False)
 
@@ -1131,6 +1137,24 @@ async def test_auto_update_check_notifies_when_behind(monkeypatch):
     assert len(orch.notices) == 1
     assert "/update" in orch.notices[0]
     assert "claude-dingtalk-bridge" in orch.notices[0]
+
+
+async def test_auto_update_check_swallows_notify_failure(monkeypatch):
+    from claude_dingtalk_bridge import self_update
+
+    async def fake_fetch(*_a, **_k):
+        return self_update.CompareResult(behind=2, subjects=["x"])
+
+    monkeypatch.setattr(daemon.self_update, "fetch_and_compare", fake_fetch)
+
+    class _FailingNotify(_StubOrchestrator):
+        async def notify(self, message):
+            raise ConnectionError("proxy blip")
+
+    # A transient blip on the nudge must not escape the check — otherwise it
+    # propagates into _auto_update_loop's while-True and silently kills the
+    # 24h update loop until the next restart.
+    await daemon._auto_update_check(_FailingNotify())
 
 
 async def test_auto_update_check_silent_when_up_to_date(monkeypatch):

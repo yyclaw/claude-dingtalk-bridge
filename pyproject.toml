@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-dingtalk-bridge"
-version = "0.3.0"
+version = "0.3.1"
 description = "Drive Claude Code remotely from a phone via DingTalk Stream mode"
 requires-python = ">=3.10"
 dependencies = [
