@@ -25,6 +25,7 @@ from claude_dingtalk_bridge.geo import CachedGeoCheck
 from claude_dingtalk_bridge.images import download_image
 from claude_dingtalk_bridge.orchestrator import Orchestrator
 from claude_dingtalk_bridge.projects import ProjectRegistry
+from claude_dingtalk_bridge.connectivity import watch_reachability, watch_wake
 from claude_dingtalk_bridge.stream_reconnect import ReconnectState
 from claude_dingtalk_bridge import self_update
 
@@ -464,9 +465,12 @@ async def _serve_stream_once(client) -> float | None:
     SDK's own ``start()`` (which embeds a 10s flat retry that triggers
     gateway lockouts) can't be used directly.
 
-    Returns the seconds the websocket stayed live, or ``None`` if the
-    connection never came up. Re-raises ``CancelledError``; logs and absorbs
-    all other failures so the outer loop just sees "no connection".
+    Returns the **wall-clock** seconds the websocket stayed live, or ``None``
+    if the connection never came up. Wall-clock (not monotonic) so a connection
+    that spanned a system sleep counts as long-lived for the backoff stability
+    check — monotonic pauses during sleep and would make it look short, falsely
+    ratcheting the backoff. Re-raises ``CancelledError``; logs and absorbs all
+    other failures so the outer loop just sees "no connection".
     """
     client.pre_start()
     connection = await asyncio.to_thread(_open_connection, client)
@@ -478,7 +482,7 @@ async def _serve_stream_once(client) -> float | None:
     opened_at: float | None = None
     try:
         async with websockets.connect(uri) as websocket:
-            opened_at = time.monotonic()
+            opened_at = time.time()
             client.websocket = websocket
             keepalive = asyncio.create_task(client.keepalive(websocket))
             try:
@@ -496,21 +500,30 @@ async def _serve_stream_once(client) -> float | None:
         logger.warning("stream connection error: %s", e)
     if opened_at is None:
         return None
-    return time.monotonic() - opened_at
+    return time.time() - opened_at
 
 
 async def _drive_stream_client(
     client,
     *,
     state: ReconnectState | None = None,
+    retry_now: asyncio.Event | None = None,
+    disconnected: asyncio.Event | None = None,
 ) -> None:
     """Run the stream client with exponential backoff between attempts.
 
     Each cycle calls ``_serve_stream_once`` for one connection attempt and
-    feeds the result to ``ReconnectState``, which computes the next delay.
+    feeds the result to ``ReconnectState``, which computes the next delay. The
+    backoff wait is interruptible: a watcher setting ``retry_now`` abandons the
+    wait, resets the backoff, and retries at once (used on system wake / network
+    return). ``disconnected`` is set while waiting and cleared while a
+    connection is live, so the reachability watcher only probes when we're down.
     """
     state = state or ReconnectState()
+    retry_now = retry_now or asyncio.Event()
+    disconnected = disconnected or asyncio.Event()
     while True:
+        disconnected.clear()
         try:
             duration = await _serve_stream_once(client)
         except asyncio.CancelledError:
@@ -519,11 +532,39 @@ async def _drive_stream_client(
             logger.exception("Stream connection raised; treating as failure")
             duration = None
         delay = state.on_disconnect(duration)
+        disconnected.set()
         logger.info("reconnect in %.1fs", delay)
-        try:
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            return
+        interrupted = await _sleep_or_retry(delay, retry_now)
+        if interrupted is None:
+            return  # cancelled
+        if interrupted:
+            state.reset()
+
+
+async def _sleep_or_retry(delay: float, retry_now: asyncio.Event) -> bool | None:
+    """Wait up to ``delay`` seconds, or until ``retry_now`` fires.
+
+    Returns ``True`` if interrupted by the event, ``False`` if the full delay
+    elapsed, or ``None`` if cancelled. Clears the event before returning so a
+    single signal triggers exactly one early retry.
+    """
+    waiter = asyncio.create_task(retry_now.wait())
+    sleeper = asyncio.create_task(asyncio.sleep(delay))
+    try:
+        done, _ = await asyncio.wait(
+            {waiter, sleeper}, return_when=asyncio.FIRST_COMPLETED
+        )
+    except asyncio.CancelledError:
+        return None
+    finally:
+        waiter.cancel()
+        sleeper.cancel()
+        with contextlib.suppress(BaseException):
+            await waiter
+        with contextlib.suppress(BaseException):
+            await sleeper
+        retry_now.clear()
+    return waiter in done
 
 
 async def _auto_update_check(orchestrator: Orchestrator) -> None:
@@ -583,7 +624,19 @@ async def _serve(client, orchestrator: Orchestrator) -> None:
             # disallow add_signal_handler; fall back to default semantics.
             pass
 
-    client_task = asyncio.create_task(_drive_stream_client(client))
+    retry_now = asyncio.Event()
+    disconnected = asyncio.Event()
+    client_task = asyncio.create_task(
+        _drive_stream_client(
+            client, retry_now=retry_now, disconnected=disconnected
+        )
+    )
+    wake_task = asyncio.create_task(watch_wake(on_wake=retry_now.set))
+    reach_task = asyncio.create_task(
+        watch_reachability(
+            is_disconnected=disconnected.is_set, on_recover=retry_now.set
+        )
+    )
     auto_update_task = asyncio.create_task(_auto_update_loop(orchestrator))
     stop_wait = asyncio.create_task(stop.wait())
     try:
@@ -591,12 +644,10 @@ async def _serve(client, orchestrator: Orchestrator) -> None:
             {client_task, stop_wait}, return_when=asyncio.FIRST_COMPLETED
         )
     finally:
-        stop_wait.cancel()
-        with contextlib.suppress(BaseException):
-            await stop_wait
-        auto_update_task.cancel()
-        with contextlib.suppress(BaseException):
-            await auto_update_task
+        for extra in (stop_wait, auto_update_task, wake_task, reach_task):
+            extra.cancel()
+            with contextlib.suppress(BaseException):
+                await extra
         try:
             await orchestrator.shutdown()
         except Exception:  # noqa: BLE001

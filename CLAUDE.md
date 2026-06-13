@@ -163,7 +163,25 @@ session produced by the desktop TUI, enabling cross-device handoff.
 WebSocket (`daemon` reconnect loop). The gateway locks out rapid reconnects
 (~30 min observed) and drops inbound messages while offline, so the SDK's flat
 10s retry can stretch a blip into a long outage. Delays climb `10→30→90→300s`
-with jitter; a connection up ≥`stable_threshold` (60s) resets the count.
+with jitter; a connection up ≥`stable_threshold` (60s) resets the count. That
+liveness is measured in **wall-clock** time (`_serve_stream_once` uses
+`time.time()`, not `time.monotonic()`): monotonic pauses during macOS sleep, so
+a connection that spanned an overnight sleep would otherwise look short-lived
+and ratchet the backoff to its max tier.
+
+Two watchers (`connectivity.py`) cut a long backoff short when the wait is
+obsolete, feeding a shared `retry_now` event that the loop's backoff sleep
+(`_sleep_or_retry`) races against; an interrupt resets the ladder and reconnects
+at once. `watch_wake` detects a sleep→wake transition from wall-vs-monotonic
+clock skew (no `pyobjc`); `watch_reachability` edge-triggers on the network
+returning, probing with `has_default_route` — a **zero-traffic** UDP `connect()`
+that only does a kernel route lookup (it sends no packet and never contacts the
+anchor IP, so it can't trip the gateway lockout). Both are frozen during sleep
+(asyncio timers don't fire while the process is suspended), so they cost nothing
+until the machine is actually awake. A `disconnected` event gates the
+reachability probe to run **only while the loop is backing off**, never while
+connected. `_serve` spawns both alongside the client and auto-update tasks,
+cancelling them on shutdown.
 
 ### Daemon packaging (`launchd.py`)
 

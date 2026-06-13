@@ -52,6 +52,22 @@ def test_exact_stable_threshold_resets_backoff():
     assert state.on_disconnect(connection_duration=60.0) == 10.0
 
 
+def test_reset_returns_backoff_to_first_delay():
+    state = _state()
+    state.on_disconnect(None)
+    state.on_disconnect(None)
+    state.on_disconnect(None)  # climbed to delays[2]
+    state.reset()
+    # After reset the next disconnect is failure #1 again.
+    assert state.on_disconnect(None) == 10.0
+
+
+def test_reset_is_idempotent_from_clean_state():
+    state = _state()
+    state.reset()
+    assert state.on_disconnect(None) == 10.0
+
+
 def test_jitter_bounds_delay_to_half_to_one_and_a_half_base():
     rng = random.Random(0)
     state = _state(jitter=True)

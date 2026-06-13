@@ -53,3 +53,12 @@ class ReconnectState:
         if self.jitter:
             return base * (0.5 + self._rand.random())
         return base
+
+    def reset(self) -> None:
+        """Clear the failure count so the next disconnect gets the shortest delay.
+
+        Called when an out-of-band signal (system wake, network return) makes
+        the accumulated backoff obsolete — the prior failures were caused by a
+        suspended process or a dead link, not by the gateway pushing back.
+        """
+        self._failure_count = 0

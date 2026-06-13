@@ -615,6 +615,91 @@ async def test_drive_stream_client_reconnects_on_failure(monkeypatch):
     assert calls == 3
 
 
+async def test_drive_stream_client_interrupt_resets_and_retries(monkeypatch):
+    # Firing retry_now during the backoff sleep must abandon the wait, reset the
+    # backoff, and immediately re-attempt — not wait the (long) delay out.
+    calls = 0
+
+    async def fake_serve_once(client):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise asyncio.CancelledError  # stop after the retry
+        return None  # first attempt fails → enter backoff
+
+    monkeypatch.setattr(daemon, "_serve_stream_once", fake_serve_once)
+    reset_calls = []
+    state = daemon.ReconnectState(delays=(3600.0,), jitter=False)  # huge delay
+    monkeypatch.setattr(state, "reset", lambda: reset_calls.append(True))
+
+    retry_now = asyncio.Event()
+    disconnected = asyncio.Event()
+
+    task = asyncio.create_task(
+        daemon._drive_stream_client(
+            object(), state=state, retry_now=retry_now, disconnected=disconnected
+        )
+    )
+    # Let the first attempt fail and the backoff wait begin.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert disconnected.is_set()  # we're in the backoff wait
+    retry_now.set()  # interrupt
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert calls == 2          # retried immediately, didn't wait 3600s
+    assert reset_calls == [True]  # backoff was reset on interrupt
+    assert not retry_now.is_set()  # event consumed/cleared
+
+
+async def test_drive_stream_client_clears_disconnected_while_serving(monkeypatch):
+    # While _serve_stream_once is running (connected), `disconnected` is clear
+    # so the reachability watcher won't probe.
+    seen = []
+    disconnected = asyncio.Event()
+
+    async def fake_serve_once(client):
+        seen.append(disconnected.is_set())
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(daemon, "_serve_stream_once", fake_serve_once)
+    state = daemon.ReconnectState(delays=(0.0,), jitter=False)
+    retry_now = asyncio.Event()
+    disconnected.set()  # start "disconnected"
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await daemon._drive_stream_client(
+            object(), state=state, retry_now=retry_now, disconnected=disconnected
+        )
+    assert seen == [False]  # cleared before the serve attempt
+
+
+async def test_drive_stream_client_runs_full_delay_when_not_interrupted(monkeypatch):
+    # When the backoff sleep elapses without an interrupt, the loop does NOT
+    # call state.reset() — only a retry signal resets.
+    calls = 0
+
+    async def fake_serve_once(client):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise asyncio.CancelledError
+        return None
+
+    monkeypatch.setattr(daemon, "_serve_stream_once", fake_serve_once)
+    state = daemon.ReconnectState(delays=(0.0,), jitter=False)  # delay elapses at once
+    reset_calls = []
+    monkeypatch.setattr(state, "reset", lambda: reset_calls.append(True))
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await daemon._drive_stream_client(
+            object(), state=state, retry_now=asyncio.Event(),
+            disconnected=asyncio.Event(),
+        )
+    assert calls == 2
+    assert reset_calls == []  # no interrupt → no reset
+
+
 async def test_chat_handler_unknown_message_type_notifies_user(caplog):
     # A message type the handler has no branch for (file, link, sticker, …)
     # used to be silently dropped. Surface it to the phone AND log it so the
@@ -808,6 +893,49 @@ async def test_serve_tolerates_missing_signal_handler_support(monkeypatch):
     # _serve still wired the rest of the lifecycle even though signal handlers
     # couldn't be installed.
     assert orch.shutdown_called == 1
+
+
+async def test_serve_spawns_and_cancels_connectivity_watchers(monkeypatch):
+    # _serve must run watch_wake and watch_reachability alongside the client,
+    # and cancel them on shutdown.
+    started = {"wake": False, "reach": False}
+    cancelled = {"wake": False, "reach": False}
+
+    async def fake_watch_wake(**kwargs):
+        started["wake"] = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled["wake"] = True
+            raise
+
+    async def fake_watch_reachability(**kwargs):
+        started["reach"] = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled["reach"] = True
+            raise
+
+    async def fake_drive(client, **kwargs):
+        # Keep running until cancelled so _serve stays in its wait.
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(daemon, "watch_wake", fake_watch_wake)
+    monkeypatch.setattr(daemon, "watch_reachability", fake_watch_reachability)
+    monkeypatch.setattr(daemon, "_drive_stream_client", fake_drive)
+
+    client = _FakeStreamClient(credential=None)
+    orch = _StubOrchestrator()
+    serve_task = asyncio.create_task(daemon._serve(client, orch))
+    # Let _serve spawn its child tasks.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert started == {"wake": True, "reach": True}
+    serve_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await serve_task
+    assert cancelled == {"wake": True, "reach": True}
 
 
 # --- _open_connection / _serve_stream_once ----------------------------
@@ -1027,6 +1155,27 @@ async def test_serve_stream_once_iterates_messages_and_returns_duration(monkeypa
     assert client.keepalive_cancelled
     assert client.websocket is not None
     assert client.background_payloads == [{"a": 1}, {"b": 2}]
+
+
+async def test_serve_stream_once_returns_wall_clock_duration(monkeypatch):
+    # Duration must be measured with time.time() (wall clock), not monotonic,
+    # so a connection that spanned a system sleep counts as long-lived for the
+    # backoff stability check.
+    monkeypatch.setattr(
+        daemon,
+        "_open_connection",
+        lambda _client: {"endpoint": "wss://gw", "ticket": "t"},
+    )
+    monkeypatch.setattr(
+        daemon.websockets, "connect", lambda uri: _FakeConnectCM(_FakeWebsocket([]))
+    )
+    times = iter([1000.0, 1605.0])  # opened, then closed 605s later (wall)
+    monkeypatch.setattr(daemon.time, "time", lambda: next(times))
+    # Make monotonic obviously different so a regression to it would fail here.
+    monkeypatch.setattr(daemon.time, "monotonic", lambda: 0.0)
+
+    result = await daemon._serve_stream_once(_FakeServeClient())
+    assert result == 605.0
 
 
 async def test_serve_stream_once_returns_none_when_handshake_raises(monkeypatch):
