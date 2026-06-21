@@ -7,6 +7,7 @@ import logging
 import re
 import signal
 import time
+from collections.abc import Awaitable, Callable
 from urllib.parse import quote_plus
 
 import dingtalk_stream
@@ -19,8 +20,14 @@ from dingtalk_stream.version import VERSION_STRING
 from claude_dingtalk_bridge.chunking import chunk_markdown, pad_code_tail
 from claude_dingtalk_bridge.claude_runner import ClaudeRunner
 from claude_dingtalk_bridge.config import Config, load_config
+from claude_dingtalk_bridge.connectivity import (
+    WAKE_SKEW_THRESHOLD,
+    wake_is_dark,
+    watch_reachability,
+    watch_wake,
+)
 from claude_dingtalk_bridge.dingtalk import DingTalkTransport
-from claude_dingtalk_bridge.display import display_path
+from claude_dingtalk_bridge.display import display_path, format_duration
 from claude_dingtalk_bridge.geo import CachedGeoCheck
 from claude_dingtalk_bridge.images import download_image
 from claude_dingtalk_bridge.orchestrator import Orchestrator
@@ -53,6 +60,16 @@ _CODE_TAIL_MARGIN = 2  # safety blanks beyond the length-scaled drop estimate
 # and stream connection settle after startup; subsequent ones run once a day.
 _AUTO_UPDATE_INITIAL_DELAY = 60
 _AUTO_UPDATE_CHECK_INTERVAL = 24 * 3600
+
+# Below this many seconds, a reconnect gap self-heals fast enough that it isn't
+# worth nagging the phone about — only longer outages (system sleep, gateway
+# lockout) risk dropping inbound messages, which DingTalk Stream never replays.
+_OFFLINE_NOTICE_THRESHOLD = 30.0
+
+# On shutdown, give an in-flight offline-recovery notice this long to finish its
+# send before tearing it down — the notice tells the phone messages may have been
+# dropped, so it's worth a brief wait, but a hung transport mustn't stall exit.
+_SHUTDOWN_NOTICE_TIMEOUT = 3.0
 
 
 def _disable_websocket_proxy() -> None:
@@ -457,16 +474,30 @@ def _open_connection(client) -> dict | None:
         return None
 
 
-async def _serve_stream_once(client) -> float | None:
+async def _serve_stream_once(
+    client,
+    *,
+    on_connect: Callable[[float], None] | None = None,
+    on_message: Callable[[], None] | None = None,
+) -> float | None:
     """Open the gateway and serve the websocket until it closes.
 
     Single-pass — the daemon's outer loop owns retry/backoff policy, so the
     SDK's own ``start()`` (which embeds a 10s flat retry that triggers
     gateway lockouts) can't be used directly.
 
-    Returns the seconds the websocket stayed live, or ``None`` if the
-    connection never came up. Re-raises ``CancelledError``; logs and absorbs
-    all other failures so the outer loop just sees "no connection".
+    ``on_connect`` (if given) is called with the wall-clock open time the moment
+    the websocket comes up, so the outer loop can measure how long it was down.
+    ``on_message`` (if given) fires on each inbound frame — proof the socket is
+    genuinely alive — so the loop can drop a stale wake/retry signal that the
+    connection outlived (see ``_drive_stream_client``).
+
+    Returns the **wall-clock** seconds the websocket stayed live, or ``None``
+    if the connection never came up. Wall-clock (not monotonic) so a connection
+    that spanned a system sleep counts as long-lived for the backoff stability
+    check — monotonic pauses during sleep and would make it look short, falsely
+    ratcheting the backoff. Re-raises ``CancelledError``; logs and absorbs all
+    other failures so the outer loop just sees "no connection".
     """
     client.pre_start()
     connection = await asyncio.to_thread(_open_connection, client)
@@ -478,11 +509,18 @@ async def _serve_stream_once(client) -> float | None:
     opened_at: float | None = None
     try:
         async with websockets.connect(uri) as websocket:
-            opened_at = time.monotonic()
+            opened_at = time.time()
             client.websocket = websocket
+            if on_connect is not None:
+                on_connect(opened_at)
             keepalive = asyncio.create_task(client.keepalive(websocket))
             try:
                 async for raw in websocket:
+                    if on_message is not None:
+                        try:
+                            on_message()
+                        except Exception:  # noqa: BLE001 - a liveness hook must not drop a live socket
+                            logger.warning("on_message hook raised", exc_info=True)
                     asyncio.create_task(
                         client.background_task(json.loads(raw))
                     )
@@ -496,34 +534,266 @@ async def _serve_stream_once(client) -> float | None:
         logger.warning("stream connection error: %s", e)
     if opened_at is None:
         return None
-    return time.monotonic() - opened_at
+    return time.time() - opened_at
 
 
 async def _drive_stream_client(
     client,
     *,
     state: ReconnectState | None = None,
+    retry_now: asyncio.Event | None = None,
+    disconnected: asyncio.Event | None = None,
+    on_recovered: Callable[[float], None] | None = None,
+    is_dark_wake: Callable[[], Awaitable[bool]] = wake_is_dark,
+    wall_clock: Callable[[], float] | None = None,
+    mono_clock: Callable[[], float] | None = None,
 ) -> None:
     """Run the stream client with exponential backoff between attempts.
 
-    Each cycle calls ``_serve_stream_once`` for one connection attempt and
-    feeds the result to ``ReconnectState``, which computes the next delay.
+    Each cycle calls ``_serve_stream_once`` for one connection attempt and feeds
+    the result to ``ReconnectState``, which computes the next delay. The backoff
+    wait is interruptible: a watcher setting ``retry_now`` (a system wake or a
+    network return) abandons the wait so the loop can reconnect at once.
+
+    The signal is *classified* before acting (``_backoff_until_retry``): a macOS
+    DarkWake — which also trips ``retry_now`` — stays in backoff, while a full
+    user wake or a genuine network return reconnects and resets the ladder. The
+    ``pmset`` probe behind that runs only here, while we're actually deciding, so
+    a connected daemon never forks one per overnight maintenance wake.
+
+    ``disconnected`` is set while waiting and cleared while a connection is live,
+    so the reachability watcher only probes when we're down.
+
+    ``on_recovered`` (if given) is called with the offline duration in seconds
+    whenever a reconnection lands after an outage longer than
+    ``_OFFLINE_NOTICE_THRESHOLD`` — the daemon was deaf to inbound messages for
+    that window and DingTalk never replays them, so the phone is told to resend.
+    The startup connection (no prior online session) never fires it.
+
+    The outage is the *sum* of two back-to-back segments: the suspend measured
+    from a wall-vs-monotonic clock baseline (the sleep *before* the socket gave
+    out) plus the live ``down_since`` gap (the socket-down wall time *after*).
+    Sleep is detected lazily — a frozen socket only fails its keepalive *after*
+    wake, so ``down_since`` alone would clock a multi-hour sleep as a few seconds;
+    the clock skew (wall advances while monotonic is frozen during sleep) recovers
+    that pre-drop suspend, while ``down_since`` covers the post-drop span (awake
+    network outage, or a later sleep the dead socket sat through). Summing — not
+    ``max`` — is what makes a "slept, socket survived a while, then died, stayed
+    down" outage report the *whole* unreachable span (≈ sleep → wake), since the
+    phone got nothing that entire time. For a pure awake outage the suspend is ~0
+    (gap dominates); for a pure wake-driven reconnect the gap is ~0 (suspend
+    dominates). The baseline is set on connect and refreshed on every inbound
+    frame (``on_message``) — proof the socket is alive *now* — so a sleep the
+    socket *fully* survives (frames resume after) is forgotten; only the suspend
+    since the last frame, i.e. the one that led to the drop, is counted.
+
+    When that measured suspend exceeds ``WAKE_SKEW_THRESHOLD`` the disconnect was
+    wake-induced: the loop self-nudges ``retry_now`` so ``_backoff_until_retry``
+    classifies it at once (a full wake reconnects now, a DarkWake stays in backoff)
+    rather than waiting the delay out — keeping a lid-open reconnect prompt without
+    a watcher having to fire. An awake outage measures ~0 suspend and backs off
+    normally. ``wall_clock``/``mono_clock`` default to ``time.time``/
+    ``time.monotonic`` (resolved at call so tests can monkeypatch the module) and
+    are injectable so the suspend measurement is unit-testable.
     """
     state = state or ReconnectState()
+    retry_now = retry_now or asyncio.Event()
+    disconnected = disconnected or asyncio.Event()
+    wall_clock = wall_clock or time.time
+    mono_clock = mono_clock or time.monotonic
+    down_since: float | None = None
+    online = False
+    # Wall/monotonic baseline of the last moment the socket was known alive, used
+    # to measure a suspend by clock skew at disconnect. ``None`` until first connect.
+    alive_wall: float | None = None
+    alive_mono = 0.0
+    # Suspend measured at the last disconnect, consumed by the next connect's notice.
+    slept_pending = 0.0
+
+    def _on_connect(opened_at: float) -> None:
+        nonlocal down_since, online, alive_wall, alive_mono, slept_pending
+        online = True
+        # A signal that fired during the connect attempt is moot now we're up;
+        # clear it so it can't skip the next, unrelated disconnect's backoff.
+        retry_now.clear()
+        prev, down_since = down_since, None
+        slept, slept_pending = slept_pending, 0.0
+        alive_wall, alive_mono = wall_clock(), mono_clock()
+        if prev is None:
+            # Startup connect: no prior online session, so this is not a
+            # recovery — never fire the notice, however large `slept` is.
+            return
+        gap = opened_at - prev
+        # The pre-drop suspend (`slept`) and the socket-down wall gap (`gap`) are
+        # two back-to-back offline segments — sum them for the true outage (≈ the
+        # span from going to sleep until waking). For a pure awake outage slept≈0;
+        # for a pure wake-driven reconnect gap≈0; only a survived sleep that then
+        # dies has both, where `max` would wrongly drop the earlier sleep.
+        offline = slept + gap
+        if on_recovered is not None and offline >= _OFFLINE_NOTICE_THRESHOLD:
+            on_recovered(offline)
+
+    def _on_message() -> None:
+        # An inbound frame proves the socket alive *now*: refresh the baseline so a
+        # sleep the socket outlived (before this frame) isn't counted as an outage.
+        nonlocal alive_wall, alive_mono
+        alive_wall, alive_mono = wall_clock(), mono_clock()
+
     while True:
+        disconnected.clear()
         try:
-            duration = await _serve_stream_once(client)
+            duration = await _serve_stream_once(
+                client, on_connect=_on_connect, on_message=_on_message
+            )
         except asyncio.CancelledError:
             return
         except Exception:  # noqa: BLE001 - one bad pass mustn't kill the loop
             logger.exception("Stream connection raised; treating as failure")
             duration = None
+        if online:
+            down_since = wall_clock()
+            online = False
+            logger.info("stream connection lost")
+        if alive_wall is not None:
+            # Skew = wall elapsed minus monotonic elapsed = time the process was
+            # suspended since last known alive (awake time advances both, cancels).
+            slept_pending = max(
+                0.0, (wall_clock() - alive_wall) - (mono_clock() - alive_mono)
+            )
+            if slept_pending > WAKE_SKEW_THRESHOLD:
+                # A wake killed the socket: classify the signal now (full wake →
+                # reconnect at once) instead of waiting the backoff out.
+                retry_now.set()
         delay = state.on_disconnect(duration)
-        logger.info("reconnect in %.1fs", delay)
-        try:
-            await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            return
+        disconnected.set()
+        outcome = await _backoff_until_retry(delay, retry_now, is_dark_wake)
+        if outcome is None:
+            return  # cancelled
+        if outcome:
+            state.reset()
+
+
+async def _backoff_until_retry(
+    delay: float,
+    retry_now: asyncio.Event,
+    is_dark_wake: Callable[[], Awaitable[bool]],
+) -> bool | None:
+    """Wait out ``delay`` of backoff, cutting it short for a genuine wake/return.
+
+    Each ``retry_now`` signal — set by a system wake *or* a network return — is
+    classified once via ``is_dark_wake``: a macOS DarkWake (radios briefly up for
+    maintenance) keeps backing off the *remaining* time; a full wake or a real
+    network return reconnects at once. A signal already pending on entry fired
+    while the dead socket was still being served, so it's classified before any
+    wait.
+
+    Crucially, a drained backoff is *also* gated on the wake classification, not
+    just a wake-induced ``retry_now``. The backoff clock is monotonic CPU time,
+    which a sleeping machine still accrues in brief DarkWake slivers; left
+    ungated it would expire mid-sleep and reconnect into the Power Nap window
+    that fleetingly raised the radios — succeeding, firing a "reconnected"
+    notice, then refreezing, and flapping the phone all night. So an elapsed
+    backoff that classifies dark re-arms instead of reconnecting; only a non-dark
+    wake/return ever breaks a sleeping backoff. An awake outage has no DarkWakes,
+    so its backoff drains uninterrupted and reconnects normally.
+
+    Logs are retrospective, never a countdown: the backoff delay is event-loop
+    time that freezes during sleep and is almost always cut short by a wake, so a
+    "retry in Xs" line would promise a moment that never arrives. Instead it marks
+    the *decision* — ``disconnected; waiting to reconnect`` on entering an awake
+    backoff, ``dark wake; still offline (maintenance wake)`` when a wake classifies
+    dark — and the *act* — ``reconnecting now (...)`` right before each real
+    attempt, with the reason. The backoff tier itself stays in ``ReconnectState``.
+
+    Returns ``True`` to reconnect early (caller resets the ladder), ``False`` if
+    the full delay elapsed, or ``None`` if cancelled.
+    """
+    remaining = delay
+    pending = retry_now.is_set()
+    if not pending:
+        logger.info("disconnected; waiting to reconnect")
+    while True:
+        if pending:
+            pending = False
+            retry_now.clear()
+            try:
+                dark = await is_dark_wake()
+            except asyncio.CancelledError:
+                return None
+            if not dark:
+                logger.info("reconnecting now (wake/network return)")
+                return True
+            logger.info("dark wake; still offline (maintenance wake)")
+            # A DarkWake's brief CPU still advances `remaining`, but the machine
+            # is asleep — re-arm the full delay so the backoff can't expire
+            # mid-sleep and reconnect. Only the non-dark branch above leaves.
+            remaining = delay
+        if remaining <= 0:
+            # Backoff drained with no wake interrupt. Reconnect only if we're
+            # genuinely awake; a drain that accumulated across silent DarkWakes
+            # is still a sleeping machine, so re-arm and keep waiting.
+            try:
+                dark = await is_dark_wake()
+            except asyncio.CancelledError:
+                return None
+            if dark:
+                logger.info("dark wake; still offline (maintenance wake)")
+                remaining = delay
+                continue
+            logger.info("reconnecting now (backoff elapsed)")
+            return False
+        start = time.monotonic()
+        interrupted = await _sleep_or_retry(remaining, retry_now)
+        if interrupted is None:
+            return None
+        if not interrupted:
+            remaining = 0
+            continue
+        remaining -= time.monotonic() - start
+        pending = True
+
+
+async def _sleep_or_retry(delay: float, retry_now: asyncio.Event) -> bool | None:
+    """Wait up to ``delay`` seconds, or until ``retry_now`` fires.
+
+    Returns ``True`` if interrupted by the event, ``False`` if the full delay
+    elapsed, or ``None`` if cancelled. Clears the event before returning so a
+    single signal triggers exactly one early retry.
+    """
+    waiter = asyncio.create_task(retry_now.wait())
+    sleeper = asyncio.create_task(asyncio.sleep(delay))
+    try:
+        done, _ = await asyncio.wait(
+            {waiter, sleeper}, return_when=asyncio.FIRST_COMPLETED
+        )
+    except asyncio.CancelledError:
+        return None
+    finally:
+        waiter.cancel()
+        sleeper.cancel()
+        with contextlib.suppress(BaseException):
+            await waiter
+        with contextlib.suppress(BaseException):
+            await sleeper
+        retry_now.clear()
+    return waiter in done
+
+
+async def _send_offline_notice(
+    orchestrator: Orchestrator, offline_seconds: float
+) -> None:
+    """Tell the phone the daemon was offline and inbound may have been dropped.
+
+    Swallows transport failures the same way ``_auto_update_check`` does: this
+    runs as a fire-and-forget task off the reconnect path, and a failed push
+    must not escape into the loop and kill it.
+    """
+    try:
+        await orchestrator.notify(
+            f"⚠️ Reconnected after ~{format_duration(int(offline_seconds))} offline."
+        )
+    except Exception:  # noqa: BLE001 - a bad notice must not kill the loop
+        logger.warning("offline-recovery notify failed", exc_info=True)
 
 
 async def _auto_update_check(orchestrator: Orchestrator) -> None:
@@ -583,7 +853,37 @@ async def _serve(client, orchestrator: Orchestrator) -> None:
             # disallow add_signal_handler; fall back to default semantics.
             pass
 
-    client_task = asyncio.create_task(_drive_stream_client(client))
+    retry_now = asyncio.Event()
+    disconnected = asyncio.Event()
+
+    # asyncio keeps only a weak reference to a bare create_task, so a
+    # fire-and-forget notice can be garbage-collected mid-flight and never reach
+    # the phone. Hold a strong reference until each one finishes.
+    notice_tasks: set[asyncio.Task] = set()
+
+    def _spawn_offline_notice(seconds: float) -> None:
+        task = asyncio.create_task(_send_offline_notice(orchestrator, seconds))
+        notice_tasks.add(task)
+        task.add_done_callback(notice_tasks.discard)
+
+    client_task = asyncio.create_task(
+        _drive_stream_client(
+            client,
+            retry_now=retry_now,
+            disconnected=disconnected,
+            on_recovered=_spawn_offline_notice,
+        )
+    )
+    # Both watchers are pure backoff-interrupters gated on `disconnected`: they
+    # nudge `retry_now` only while the loop is down, never while connected.
+    wake_task = asyncio.create_task(
+        watch_wake(is_disconnected=disconnected.is_set, on_wake=retry_now.set)
+    )
+    reach_task = asyncio.create_task(
+        watch_reachability(
+            is_disconnected=disconnected.is_set, on_recover=retry_now.set
+        )
+    )
     auto_update_task = asyncio.create_task(_auto_update_loop(orchestrator))
     stop_wait = asyncio.create_task(stop.wait())
     try:
@@ -591,16 +891,30 @@ async def _serve(client, orchestrator: Orchestrator) -> None:
             {client_task, stop_wait}, return_when=asyncio.FIRST_COMPLETED
         )
     finally:
-        stop_wait.cancel()
+        for extra in (stop_wait, auto_update_task, wake_task, reach_task):
+            extra.cancel()
+            with contextlib.suppress(BaseException):
+                await extra
+        # Stop the stream driver before draining notices: a reconnect during
+        # shutdown spawns an offline notice from `_on_connect`, and one landing
+        # after the drain's snapshot below would never be awaited. Cancelling
+        # the driver first freezes `notice_tasks` so the drain sees every one.
+        client_task.cancel()
         with contextlib.suppress(BaseException):
-            await stop_wait
-        auto_update_task.cancel()
-        with contextlib.suppress(BaseException):
-            await auto_update_task
+            await client_task
+        # Let an in-flight offline-recovery notice finish its send rather than
+        # dropping the "messages may have been lost" hint mid-flight; bound the
+        # wait so a hung transport can't stall exit, then cancel any straggler.
+        if notice_tasks:
+            with contextlib.suppress(BaseException):
+                _, pending = await asyncio.wait(
+                    set(notice_tasks), timeout=_SHUTDOWN_NOTICE_TIMEOUT
+                )
+                for task in pending:
+                    task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await task
         try:
             await orchestrator.shutdown()
         except Exception:  # noqa: BLE001
             logger.exception("Orchestrator shutdown raised")
-        client_task.cancel()
-        with contextlib.suppress(BaseException):
-            await client_task

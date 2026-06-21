@@ -112,6 +112,26 @@ def format_uptime(seconds: int) -> str:
     return " ".join(parts)
 
 
+def format_duration(seconds: int) -> str:
+    """Render a duration compactly with seconds granularity: ``45s``, ``1m35s``,
+    ``2h5m``, ``1d3h``.
+
+    Like :func:`format_uptime` but keeps sub-minute precision (``45s`` rather
+    than ``just now``) and rolls minutes up into hours/days, so a multi-hour
+    offline gap reads ``8h40m`` instead of ``520m``. Zero-valued components are
+    dropped; a zero input renders ``0s``.
+    """
+    days, rem = divmod(int(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = [
+        f"{value}{unit}"
+        for value, unit in ((days, "d"), (hours, "h"), (minutes, "m"), (secs, "s"))
+        if value
+    ]
+    return "".join(parts) if parts else "0s"
+
+
 def format_relative_time(epoch_ms: int, now_ms: int | None = None) -> str:
     """Render an epoch-ms timestamp as a phone-friendly relative time."""
     now = now_ms if now_ms is not None else int(time.time() * 1000)

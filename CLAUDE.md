@@ -37,13 +37,12 @@ Inbound and outbound messages travel separate paths:
   `picture`/`richText` → images downloaded (`images.download_image`) and
   assembled into a prompt (`build_image_prompt`) before the turn runs.
 - **Outbound**: `DingTalkTransport` (`dingtalk.py`) pushes 1:1 messages via the
-  DingTalk Open API REST endpoints, managing its own access token. It is
-  sync/`requests`-based, called from async code via `asyncio.to_thread`.
-  Markdown replies that exceed DingTalk's per-message limit are split first by
-  `chunking.chunk_markdown` — a **UTF-8 byte**-budgeted, fence-aware splitter
-  that reopens/closes a carried-over code fence across chunk boundaries (so a
-  split mid-block stays valid) — and each piece is run through `pad_code_tail`
-  before send. `daemon.send_markdown` lifts the title per chunk.
+  DingTalk Open API REST endpoints, managing its own access token. Sync/`requests`-
+  based, called from async via `asyncio.to_thread`. Replies over the per-message
+  limit are split by `chunking.chunk_markdown` — a **UTF-8 byte**-budgeted,
+  fence-aware splitter that reopens/closes a carried-over code fence across
+  boundaries — each piece run through `pad_code_tail`; `daemon.send_markdown` lifts
+  the title per chunk.
 
 `daemon.build_orchestrator` wires everything. The `ClaudeRunner` ↔ orchestrator
 cycle is broken by late assignment: after both exist, the runner's
@@ -55,21 +54,17 @@ cycle is broken by late assignment: after both exist, the runner's
 Single-threaded async coordinator holding all mutable session state.
 
 - One task at a time (`self._task`); prompts arriving mid-task are queued
-  (`self._queue`) and drained sequentially. `/queue` views the queue, `/queue rm
-  N` drops one, `/queue rm all`/`/queue clear` empties it. A bare `/stop`
-  interrupts the turn and lets the next queued prompt auto-start; `/stop all`
-  interrupts **and** clears the queue (the queue is cleared *before* the abort,
-  so `_run`'s finally can't auto-advance). Exception: a prompt arriving while
-  the runner is in its post-turn drain (`runner.is_draining`) calls
-  `cancel_drain()` and starts immediately, rather than waiting out a possibly-
-  stuck background-agent wait.
-- Control commands (`commands.parse_command`) are handled immediately, never
-  queued: slash-prefixed (`/stop [all]`, `/clear`, `/queue`, `/verbose`,
-  `/debug`, `/model`, `/mode`, `/cd`, `/ls`, `/pwd`, `/status`, `/session`,
-  `/resume`, `/update`, `/help [command]`; full map in `commands.py`) plus the bare
-  permission replies (`ok`/`yes`/`approve`/👌, `no`/`deny`/`reject`/❌).
-  `/compact`, `/context` are forwarded verbatim to Claude as SDK slash
-  commands. An unrecognized `/...` becomes `UNKNOWN`, not a prompt.
+  (`self._queue`) and drained sequentially. `/queue` views/edits it (`/queue rm
+  N`, `/queue clear`). A bare `/stop` interrupts the turn and lets the next queued
+  prompt auto-start; `/stop all` clears the queue **before** the abort so `_run`'s
+  finally can't auto-advance. Exception: a prompt arriving during the runner's
+  post-turn drain (`runner.is_draining`) calls `cancel_drain()` and starts
+  immediately, rather than waiting out a possibly-stuck background-agent wait.
+- Control commands (`commands.parse_command`, full map in `commands.py`) are
+  handled immediately, never queued: slash-prefixed (`/stop`, `/cd`, `/resume`,
+  `/update`, …) plus bare permission replies (`ok`/`yes`/👌, `no`/`deny`/❌).
+  `/compact`, `/context` are forwarded verbatim as SDK slash commands. An
+  unrecognized `/...` becomes `UNKNOWN`, not a prompt.
 - Command help lives in one place: `commands.HELP` (a `{name: HelpEntry}`
   registry). `/help` renders the grouped one-line list; `/help <command>` adds
   that entry's `detail`. Inline "usage" errors (e.g. `/resume`, `/queue rm …`)
@@ -94,15 +89,13 @@ Two independent layers gate tool use:
   (`ok`/`no` resolves it); `AskUserQuestion` routes to `answer_question` the
   same way.
 - **Hard-deny hook** (`permission_hooks.py`) — a `PreToolUse` Bash hook
-  (`make_bash_permission_hook`) that blocks a fixed set of catastrophic literals
-  (`rm -rf` incl. split flags, `find -delete`, `dd of=/dev/…`, `newfs`,
-  `diskutil`/`asr`/`gpt` destructive verbs, fork bomb, redirect to a block
-  device) and variable-substituted command names (`$CMD`). It parses with `bashlex` and
-  recurses into `bash -c`/`eval`. It returns `deny` — the only verdict that holds
-  across every `permission_mode`, so no settings allow-rule or `bypassPermissions`
-  can undo it. Path-level rules (`Bash(rm:*)`) are *not* here — those live in
-  Claude Code's own settings layers. `make check` smoke-tests the guard
-  (`scripts/check_bash_permissions.py`).
+  (`make_bash_permission_hook`) blocking a fixed set of catastrophic literals
+  (`rm -rf`, `find -delete`, `dd of=/dev/…`, `diskutil`/`asr`/`gpt` verbs, fork
+  bomb, …) and variable-substituted command names. Parses with `bashlex`, recurses
+  into `bash -c`/`eval`. Returns `deny` — the only verdict that holds across every
+  `permission_mode`, so no allow-rule or `bypassPermissions` can undo it.
+  Path-level rules (`Bash(rm:*)`) live in Claude Code's own settings, not here.
+  `make check` smoke-tests it (`scripts/check_bash_permissions.py`).
 
 ### Geo gate (optional)
 
@@ -115,26 +108,20 @@ skip both the check and the proxy.
 
 ### Self-update (`self_update.py`)
 
-`/update` updates the daemon program itself (its own repo, **not** the user's
-`projects`). `self_update.py` wraps the git/make steps as async subprocess
-helpers (`fetch_and_compare`, `snapshot`, `pull` — `--ff-only` only,
-`run_make`, `trigger_restart_detached`), raising `SelfUpdateError` (carrying the
-captured output) on any failure. `repo_root()` is the package's `parents[2]`
-(the daemon always runs from an editable install). `_cmd_update` refuses while a
-turn runs (like `/cd`), reports "up to date" when not behind, else pulls, runs
-`make setup`/`make config` only when `pyproject.toml`/`config.example.yaml`
-changed, then **confirms before restarting** via `self._restart_confirm` (a
-future the bare `ok`/`no` reply resolves in `_cmd_permission_reply`, ahead of the
-tool-permission path). The restart runs detached (`start_new_session=True`) so
-`launchctl kickstart -k` survives the daemon's own SIGTERM; the new instance's
-CLI path sends the "🔄 Daemon restarted" notice.
+`/update` updates the daemon's **own** repo (not the user's `projects`).
+`self_update.py` wraps the git/make steps as async helpers (`pull` is `--ff-only`
+only), raising `SelfUpdateError` (with captured output) on failure. `_cmd_update`
+refuses while a turn runs (like `/cd`), reports "up to date" when not behind, else
+pulls, runs `make setup`/`config` only when `pyproject.toml`/`config.example.yaml`
+changed, then **confirms before restarting** via `self._restart_confirm` (bare
+`ok`/`no` resolves it, ahead of the tool-permission path). Restart runs detached
+(`start_new_session=True`) so `launchctl kickstart -k` survives the daemon's own
+SIGTERM; the new instance sends the "🔄 Daemon restarted" notice.
 
-`daemon._auto_update_loop` checks once `_AUTO_UPDATE_INITIAL_DELAY` (60s) after
-startup, then every `_AUTO_UPDATE_CHECK_INTERVAL` (24h): a silent
-`fetch_and_compare` that nudges the phone only when behind. Up-to-date and
-errors are silent (errors logged, never pushed) — a failed check (offline, or
-SSH-auth under launchd's minimal `PATH`/no-agent env) can't become daily noise.
-Wired in `_serve`, cancelled on shutdown.
+`daemon._auto_update_loop` checks 60s after startup then every 24h: a silent
+`fetch_and_compare` that nudges the phone only when behind. Up-to-date and errors
+stay silent (errors logged) so a failed check (offline, or SSH-auth under
+launchd's minimal env) can't become daily noise. Wired in `_serve`.
 
 ### Sessions
 
@@ -143,14 +130,12 @@ and an active `_current_project` (defaults to the first in config); `/cd <name>`
 switches it. `/cd` resets the target project's session (and its usage tallies)
 via `runner.reset`, so a switch starts that project fresh.
 
-`/ls reload` picks up a hand-edited `projects` list without restarting the
-daemon: `config.load_projects` re-reads **only** that section (no perm check, no
-other config) and rebuilds the registry. The rest of the config and all session
-state stay live. If the active project's name vanished (removed/renamed), the
-reload falls back to the default via the normal `_cmd_switch_project` path
-(resetting that session and announcing the switch); an edited path on a still-
-present name just re-points `_current_project` at the fresh object. The daemon
-reloads from `_config_path` (defaults to `DEFAULT_CONFIG_PATH`).
+`/ls reload` picks up a hand-edited `projects` list without restarting:
+`config.load_projects` re-reads **only** that section and rebuilds the registry;
+the rest of the config and all session state stay live. If the active project's
+name vanished, the reload falls back to the default (resetting that session and
+announcing the switch); an edited path on a still-present name just re-points
+`_current_project` at the fresh object.
 
 `ClaudeRunner` keeps a Claude session ID per project path and passes it as
 `resume` next turn, giving each project a continuous conversation. Sticky until
@@ -159,24 +144,46 @@ session produced by the desktop TUI, enabling cross-device handoff.
 
 ### Stream reconnect
 
-`stream_reconnect.ReconnectState` is a backoff machine for the DingTalk Stream
+`stream_reconnect.ReconnectState` is the backoff machine for the DingTalk Stream
 WebSocket (`daemon` reconnect loop). The gateway locks out rapid reconnects
-(~30 min observed) and drops inbound messages while offline, so the SDK's flat
-10s retry can stretch a blip into a long outage. Delays climb `10→30→90→300s`
-with jitter; a connection up ≥`stable_threshold` (60s) resets the count.
+(~30 min observed) and drops inbound messages while offline, so a flat retry can
+stretch a blip into a long outage. Delays climb `10→30→90→300s` with jitter; a
+connection up ≥`stable_threshold` (60s) resets the count. Liveness and outage
+duration use **wall-clock** time (`time.time()`), not `monotonic` — monotonic
+freezes during macOS sleep, which would mis-measure an overnight connection.
+
+Two watchers (`connectivity.py`) break an obsolete backoff via a shared
+`retry_now` event, but **only while down** (gated on the `disconnected` event; a
+live socket's own I/O surfaces any death). The loop classifies the wake once, via
+`pmset -g log` (`wake_is_dark`): a real **Wake** (lid open / network return)
+reconnects at once; a maintenance **DarkWake** (fired every few minutes with the
+lid shut) stays in backoff so the daemon doesn't flap all night. The classifier
+fails open, is recency-windowed (`WAKE_RECENCY`, 30s), and matches the pmset
+Domain column by exact tab-split (other `Wake*` rows would false-match on
+whitespace). `watch_wake` covers a wake *during* backoff (clock-skew baseline,
+kept fresh even when connected); `watch_reachability` edge-triggers on the network
+returning via a **zero-traffic** UDP `connect()` (route lookup, no packet, can't
+trip the lockout). Both freeze during sleep, costing nothing until wake.
+
+The "Reconnected after ~Xm offline" notice must report the **true** outage
+including pre-drop suspend, which a frozen socket can't see (its keepalive only
+fails *after* wake). `_drive_stream_client` measures the suspend by clock skew and
+reports `slept + gap` (see `daemon.py` for the math). A `slept` over
+`WAKE_SKEW_THRESHOLD` also self-nudges `retry_now` for an immediate reconnect;
+`_on_connect` clears `retry_now` so a mid-connect signal can't skip the next
+backoff. `_serve` spawns both watchers; shutdown **awaits** any in-flight offline
+notice up to `_SHUTDOWN_NOTICE_TIMEOUT` so the resend hint isn't dropped.
 
 ### Daemon packaging (`launchd.py`)
 
 macOS 26 forbids regular processes from writing `~/Library/LaunchAgents`, so
 `make daemon-install` builds an ad-hoc-signed `~/Applications/Claude DingTalk
-Bridge.app` bundle (Info.plist) with the agent plist nested at
-`Contents/Library/LaunchAgents/`; a Swift helper (`resources/AppHelper.swift`,
-compiled at install via `xcrun swiftc`) registers the service through
-SMAppService and execs the daemon. Install failures usually mean a missing
-`xcode-select` toolchain. `daemon-start` runs `launchctl kickstart
-gui/<uid>/<label>` (falling back to `bootstrap gui/<uid> <plist>` when booted
-out), `stop` runs `bootout`, `restart` runs `kickstart -k` — never touch
-`~/Library/LaunchAgents` by hand.
+Bridge.app` bundle with the agent plist nested at `Contents/Library/LaunchAgents/`;
+a Swift helper (`resources/AppHelper.swift`, compiled via `xcrun swiftc`) registers
+it through SMAppService and execs the daemon. Install failures usually mean a
+missing `xcode-select` toolchain. `daemon-start` runs `launchctl kickstart`
+(falling back to `bootstrap` when booted out), `stop` runs `bootout`, `restart`
+runs `kickstart -k` — never touch `~/Library/LaunchAgents` by hand.
 
 `cli.py._notify_phone` pushes a notice on `start`/`stop`/`restart`. The daemon
 can't tell stop from restart (both arrive as SIGTERM), so these labels live at
@@ -209,17 +216,12 @@ total and the last turn's cache read/write breakdown.
   lead with one emoji icon and use short bulleted lines.
 - The daemon must never let one bad message kill the loop — handlers catch
   broadly and log.
-- Reuse the formatting helpers instead of inlining new ones:
-  - `display.format_tokens(n)` for token counts (`1.2K` / `45K` / `1.5M`).
-  - For any path rendered to phone or log, apply the two-step shortening
-    (project-relative first, then `$HOME` → `~`). Pick by **input shape**:
-    - `display.display_path(path)` for a single whole path.
-    - `display.collapse_inline_paths(s)` for free-form text *containing* paths
-      (Bash commands, tool previews, log lines). `tool_summary()`
-      (`claude_runner.py`) already wraps its output in this — don't collapse a
-      second time on phone ToolEvents or the permission prompt.
-    Both read the active turn's project root from `log_context.cwd_label()`;
-    callers outside the turn loop pass `cwd=` explicitly.
+- Reuse formatting helpers, don't inline: `display.format_tokens(n)` for token
+  counts; `display.display_path(path)` for a whole path, or
+  `display.collapse_inline_paths(s)` for free-form text *containing* paths.
+  `tool_summary()` (`claude_runner.py`) already collapses — don't double-collapse
+  phone ToolEvents or the permission prompt. Both read the turn root from
+  `log_context.cwd_label()`; callers outside the turn loop pass `cwd=` explicitly.
 - Phone rendering — DingTalk renders `sampleMarkdown` in a smaller font than chat
   bubbles, so default short notices to `self._send` (sampleText) and reserve
   `self._send_markdown` for content that needs formatting (Claude's reply,

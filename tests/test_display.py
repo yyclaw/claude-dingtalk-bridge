@@ -4,6 +4,7 @@ from claude_dingtalk_bridge.display import (
     collapse_inline_paths,
     display_path,
     format_cost,
+    format_duration,
     format_relative_time,
     format_size,
     format_tokens,
@@ -45,6 +46,26 @@ def test_format_uptime_drops_zero_components():
     assert format_uptime(3 * 86400 + 4 * 3600 + 5 * 60 + 30) == "3d 4h 5m"
     # seconds in the trailing minute are floored away
     assert format_uptime(3661) == "1h 1m"
+
+
+def test_format_duration_keeps_sub_minute_seconds():
+    assert format_duration(0) == "0s"
+    assert format_duration(45) == "45s"
+    assert format_duration(59) == "59s"
+
+
+def test_format_duration_shows_minutes_and_seconds():
+    assert format_duration(60) == "1m"
+    assert format_duration(95) == "1m35s"
+    assert format_duration(120) == "2m"
+
+
+def test_format_duration_rolls_up_into_hours_and_days():
+    # An overnight lid-shut gap reads in hours, not "520m".
+    assert format_duration(8 * 3600) == "8h"
+    assert format_duration(8 * 3600 + 40 * 60) == "8h40m"
+    assert format_duration(86400 + 3 * 3600) == "1d3h"
+    assert format_duration(86400 + 5) == "1d5s"
 
 
 def test_md_escape_neutralizes_special_chars():
