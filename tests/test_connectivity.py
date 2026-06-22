@@ -111,117 +111,47 @@ def test_has_default_route_false_when_socket_creation_raises(monkeypatch):
 # --- wake classification ------------------------------------------------
 
 
-# Real pmset rows: domain column is space-padded and tab-separated from the body.
-_PMSET_SAMPLE = (
-    "2026-06-20 10:53:21 +0800 DarkWake            \tDarkWake from Deep Idle : rtc 2 secs\n"
-    "short line\n"
-    "2026-06-20 11:00:00 +0800 Sleep               \tEntering Sleep state\n"
-    "2026-06-20 11:18:03 +0800 Wake                \tWake from Deep Idle : lid HID 3 secs\n"
+# `pmset -g systemstate` reports the *live* current power state. A full/awake
+# state lists the Graphics capability; a DarkWake (CPU/network up for
+# maintenance, display subsystem down) omits it.
+_SYSTEMSTATE_FULL = (
+    "Current System Capabilities are: CPU Graphics Audio Network \n"
+    "Current Power State: 4\n"
+)
+_SYSTEMSTATE_DARK = (
+    "Current System Capabilities are: CPU Network \n"
+    "Current Power State: 1\n"
 )
 
 
-def test_parse_wake_is_dark_picks_latest_full_wake():
-    # Scanning from the tail, the newest (completed) wake row is a full Wake.
-    assert conn.parse_wake_is_dark(_PMSET_SAMPLE) is False
+def test_parse_capabilities_full_wake_has_graphics():
+    assert conn.parse_capabilities_are_dark(_SYSTEMSTATE_FULL) is False
 
 
-def test_parse_wake_is_dark_skips_malformed_tail_rows():
-    # A short/malformed row newer than the last real wake is skipped by the
-    # tail-first scan rather than mistaken for an event.
-    log = (
-        "2026-06-20 11:18:03 +0800 Wake                \tWake from Deep Idle\n"
-        "short line\n"
-    )
-    assert conn.parse_wake_is_dark(log) is False
+def test_parse_capabilities_dark_wake_lacks_graphics():
+    # The 01:00 spurious-reconnect case: a 2s maintenance DarkWake. Read from the
+    # live state, Graphics is absent the instant the wake happens — no race
+    # against pmset's asynchronous log write, no recency window to age out.
+    assert conn.parse_capabilities_are_dark(_SYSTEMSTATE_DARK) is True
 
 
-def test_parse_wake_is_dark_picks_latest_dark_wake():
-    log = (
-        "2026-06-20 11:18:03 +0800 Wake                \tWake from Deep Idle : lid\n"
-        "2026-06-20 11:33:00 +0800 DarkWake            \tDarkWake from Deep Idle\n"
-    )
-    assert conn.parse_wake_is_dark(log) is True
+def test_parse_capabilities_none_when_no_capability_line():
+    # Without the capabilities line we can't tell; callers fail open.
+    assert conn.parse_capabilities_are_dark("Current Power State: 4\n") is None
 
 
-def test_parse_wake_is_dark_ignores_wake_requests_schedule_rows():
-    # "Wake Requests" (and WakeTime/WakeDetails) start with the token "Wake" but
-    # are NOT wake events — a naive split misreads them and flips a DarkWake to a
-    # full wake. The latest real event here is a DarkWake, so it stays dark.
-    log = (
-        "2026-06-20 15:49:09 +0800 DarkWake            \tDarkWake from Deep Idle\n"
-        "2026-06-20 15:49:56 +0800 Wake Requests       \t[*process=dasd request=x]\n"
-        "2026-06-20 15:50:00 +0800 WakeTime            \tWakeTime stats\n"
-    )
-    assert conn.parse_wake_is_dark(log) is True
+def test_parse_capabilities_matches_whole_token_not_substring():
+    # Capabilities are whitespace-separated tokens; a token that merely contains
+    # the letters must not be read as the Graphics capability.
+    log = "Current System Capabilities are: CPU GraphicsX Network \n"
+    assert conn.parse_capabilities_are_dark(log) is True
 
 
-def test_parse_wake_is_dark_none_when_no_wake_line():
-    row = "2026-06-20 11:00:00 +0800 Sleep               \tEntering Sleep state\n"
-    assert conn.parse_wake_is_dark(row) is None
-
-
-def _epoch(stamp: str) -> float:
-    from datetime import datetime
-
-    return datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S %z").timestamp()
-
-
-def test_parse_wake_is_dark_in_progress_wake_ignores_recency_window():
-    # A DarkWake still in progress (no completed "N secs" suffix yet) is the
-    # current power state, so it classifies dark even though it *started* well
-    # outside the recency window — the 10:53 lid-shut "wake/network return"
-    # misread, where a 125s maintenance DarkWake had aged out by its start time.
-    log = "2026-06-20 15:58:00 +0800 DarkWake            \tDarkWake from Deep Idle\n"
-    now = _epoch("2026-06-20 15:59:00 +0800")  # 60s after start, still running
-    assert conn.parse_wake_is_dark(log, now=now, max_age=30.0) is True
-
-
-def test_parse_wake_is_dark_excludes_stale_wake_outside_window():
-    # A *completed* DarkWake that ended hours ago must not be classified as "the
-    # wake that just happened" — otherwise a genuine network recovery would be
-    # wrongly suppressed. Recency is judged by its end (start + duration).
-    log = (
-        "2026-06-20 10:00:00 +0800 DarkWake            "
-        "\tDarkWake from Deep Idle 120 secs\n"
-    )
-    now = _epoch("2026-06-20 16:00:00 +0800")  # 6h after it ended
-    assert conn.parse_wake_is_dark(log, now=now, max_age=30.0) is None
-
-
-def test_parse_wake_is_dark_keeps_recent_wake_within_window():
-    # A completed DarkWake that ended just now is within the window.
-    log = (
-        "2026-06-20 15:59:50 +0800 DarkWake            "
-        "\tDarkWake from Deep Idle 5 secs\n"
-    )
-    now = _epoch("2026-06-20 16:00:00 +0800")  # ended 15:59:55, 5s ago
-    assert conn.parse_wake_is_dark(log, now=now, max_age=30.0) is True
-
-
-def test_parse_wake_is_dark_keeps_unparseable_timestamp_failing_open():
-    # A completed row whose timestamp we can't parse is kept, not dropped: a real
-    # wake we couldn't date must still classify rather than vanish.
-    log = "2026-13-99 25:61:61 +0800 Wake                \tWake from Deep Idle 5 secs\n"
-    now = _epoch("2026-06-20 16:00:00 +0800")
-    assert conn.parse_wake_is_dark(log, now=now, max_age=30.0) is False
-
-
-async def test_wake_is_dark_ignores_stale_wake(monkeypatch):
-    # The reconnect loop passes `now`; a DarkWake older than the window reads as
-    # "no recent wake" → False (fail open), so a real recovery still reconnects.
-    monkeypatch.setattr(
-        conn, "_pmset_log",
-        lambda: "2026-06-20 10:00:00 +0800 DarkWake            \tDarkWake 120 secs\n",
-    )
-    now = _epoch("2026-06-20 16:00:00 +0800")
-    assert await conn.wake_is_dark(now=now, max_age=30.0) is False
-
-
-def test_pmset_log_invokes_pmset(monkeypatch):
+def test_pmset_systemstate_invokes_pmset(monkeypatch):
     captured = {}
 
     class _Proc:
-        stdout = "the log"
+        stdout = "the state"
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
@@ -229,24 +159,25 @@ def test_pmset_log_invokes_pmset(monkeypatch):
         return _Proc()
 
     monkeypatch.setattr(conn.subprocess, "run", fake_run)
-    assert conn._pmset_log() == "the log"
-    assert captured["cmd"] == conn.PMSET_CMD
+    assert conn._pmset_systemstate() == "the state"
+    assert captured["cmd"] == conn.PMSET_STATE_CMD
     assert captured["kwargs"]["timeout"] == conn.PMSET_TIMEOUT
 
 
 async def test_wake_is_dark_true_for_dark_wake(monkeypatch):
-    monkeypatch.setattr(
-        conn, "_pmset_log",
-        lambda: "2026 11:33:00 +0800 DarkWake            \tDarkWake from Deep Idle",
-    )
+    monkeypatch.setattr(conn, "_pmset_systemstate", lambda: _SYSTEMSTATE_DARK)
     assert await conn.wake_is_dark() is True
 
 
 async def test_wake_is_dark_false_for_full_wake(monkeypatch):
-    monkeypatch.setattr(
-        conn, "_pmset_log",
-        lambda: "2026 11:18:03 +0800 Wake                \tWake from Deep Idle lid",
-    )
+    monkeypatch.setattr(conn, "_pmset_systemstate", lambda: _SYSTEMSTATE_FULL)
+    assert await conn.wake_is_dark() is False
+
+
+async def test_wake_is_dark_fails_open_when_no_capability_line(monkeypatch):
+    # A truncated/empty readout we can't classify fails open to non-dark, so a
+    # real wake still reconnects rather than getting stuck offline.
+    monkeypatch.setattr(conn, "_pmset_systemstate", lambda: "")
     assert await conn.wake_is_dark() is False
 
 
@@ -254,9 +185,9 @@ async def test_wake_is_dark_fails_open_when_pmset_raises(monkeypatch, caplog):
     def boom():
         raise OSError("pmset missing")
 
-    monkeypatch.setattr(conn, "_pmset_log", boom)
+    monkeypatch.setattr(conn, "_pmset_systemstate", boom)
     assert await conn.wake_is_dark() is False
-    assert "pmset wake-type probe failed" in caplog.text
+    assert "pmset systemstate probe failed" in caplog.text
 
 
 # --- async drivers ------------------------------------------------------

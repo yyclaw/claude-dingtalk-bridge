@@ -154,13 +154,16 @@ freezes during macOS sleep, which would mis-measure an overnight connection.
 
 Two watchers (`connectivity.py`) break an obsolete backoff via a shared
 `retry_now` event, but **only while down** (gated on the `disconnected` event; a
-live socket's own I/O surfaces any death). The loop classifies the wake once, via
-`pmset -g log` (`wake_is_dark`): a real **Wake** (lid open / network return)
-reconnects at once; a maintenance **DarkWake** (fired every few minutes with the
-lid shut) stays in backoff so the daemon doesn't flap all night. The classifier
-fails open, is recency-windowed (`WAKE_RECENCY`, 30s), and matches the pmset
-Domain column by exact tab-split (other `Wake*` rows would false-match on
-whitespace). `watch_wake` covers a wake *during* backoff (clock-skew baseline,
+live socket's own I/O surfaces any death). The loop classifies the wake once via
+`wake_is_dark`, reading the **live** power state from `pmset -g systemstate`
+(`parse_capabilities_are_dark`): the `Graphics` capability present → full wake,
+reconnect now; a maintenance **DarkWake** (lid shut, every few minutes) lacks it →
+stay in backoff so the daemon doesn't flap all night. Fails open (no capabilities
+line → awake). Reading *current* capabilities, not scraping the async-written
+`pmset -g log`, is deliberate: the log lags the wake (a 2s DarkWake once
+reconnected before its row was published), while the capability flips with the
+wake — no race, no recency window. Display *idle*-sleep keeps `Graphics`, so an
+awake screen-off outage isn't misread as dark. `watch_wake` covers a wake *during* backoff (clock-skew baseline,
 kept fresh even when connected); `watch_reachability` edge-triggers on the network
 returning via a **zero-traffic** UDP `connect()` (route lookup, no packet, can't
 trip the lockout). Both freeze during sleep, costing nothing until wake.

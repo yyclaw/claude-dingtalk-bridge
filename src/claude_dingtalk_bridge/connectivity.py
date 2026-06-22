@@ -16,24 +16,16 @@ import socket
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 WAKE_TICK = 5.0
 WAKE_SKEW_THRESHOLD = 10.0
 REACH_TICK = 15.0
-# How recent a pmset wake row must be to classify "the wake that just happened".
-# The reconnect loop calls `wake_is_dark` on every retry signal — including a
-# network-return that has no associated wake at all — so without a window it
-# would consult the last wake *ever* logged (a DarkWake from hours ago) and
-# wrongly suppress a genuine recovery. The window must outlast the reachability
-# tick plus a DarkWake's brief radio-up span (so a DarkWake-induced edge is still
-# classified dark) yet stay far below "hours" — see `parse_wake_is_dark`.
-WAKE_RECENCY = 30.0
-# `pmset -g log` is read only when the reconnect loop is deciding whether to skip
-# its backoff (rare), in a thread; cap it so a hung subprocess can't wedge it.
-PMSET_CMD = ("/usr/bin/pmset", "-g", "log")
+# `pmset -g systemstate` is read only when the reconnect loop is deciding whether
+# to skip its backoff (rare), in a thread; cap it so a hung subprocess can't
+# wedge it.
+PMSET_STATE_CMD = ("/usr/bin/pmset", "-g", "systemstate")
 PMSET_TIMEOUT = 10.0
 # Only used to force the kernel to pick the default route. UDP connect() sends
 # no packet, so this address is never actually contacted — its only job is to
@@ -73,91 +65,38 @@ class WakeWatcher:
         return skew if skew > self._threshold else None
 
 
-def _parse_pmset_time(date: str, clock: str, tz: str) -> float | None:
-    """Parse a pmset row's ``<date> <time> <tz>`` columns to an epoch second.
+def parse_capabilities_are_dark(systemstate_output: str) -> bool | None:
+    """Classify the system's *current* power state from ``pmset -g systemstate``.
 
-    Returns ``None`` if the columns don't parse (a locale/format we don't know),
-    so callers can fail open rather than drop a row they can't date.
+    The output carries a line ``Current System Capabilities are: CPU Graphics
+    Audio Network``. A macOS **DarkWake** brings the CPU and network up for
+    maintenance (Power Nap, keepalive) but leaves the graphics subsystem down, so
+    the ``Graphics`` capability is the authoritative discriminator
+    (``kIOPMSystemCapabilityGraphics``): present → a full/awake state, absent → a
+    dark wake. Display *idle*-sleep keeps ``Graphics`` (the system is still fully
+    awake, only the panel is off), so an awake screen-off network outage is not
+    misread as dark — verified on macOS 26.
+
+    Returns ``True`` for a dark wake, ``False`` for a full/awake state, ``None``
+    if the capabilities line isn't present (so callers can fail open).
+
+    Unlike the previous ``pmset -g log`` scrape this reads the *live current*
+    state: there is no race against pmset's asynchronous log write (which once
+    let a 2s maintenance DarkWake reconnect because its log row wasn't published
+    yet) and no recency window to age a long maintenance wake out — the capability
+    flips synchronously with the wake transition itself.
     """
-    try:
-        dt = datetime.strptime(f"{date} {clock} {tz}", "%Y-%m-%d %H:%M:%S %z")
-    except ValueError:
-        return None
-    return dt.timestamp()
-
-
-def _parse_pmset_duration(message: str) -> float | None:
-    """Seconds a wake lasted, read from the trailing ``N secs`` pmset appends
-    when a wake *ends*.
-
-    ``None`` while the wake is still in progress (the suffix isn't written yet) —
-    which is the signal that the row is the *current* power state, not a past
-    event. The duration is always the last ``<int> secs`` token of the row.
-    """
-    tokens = message.split()
-    if len(tokens) >= 2 and tokens[-1] == "secs" and tokens[-2].isdigit():
-        return float(tokens[-2])
+    marker = "Current System Capabilities are:"
+    for line in systemstate_output.splitlines():
+        _, sep, caps = line.partition(marker)
+        if sep:
+            return "Graphics" not in caps.split()
     return None
 
 
-def parse_wake_is_dark(
-    pmset_log: str, *, now: float | None = None, max_age: float | None = None
-) -> bool | None:
-    """Classify the most recent wake *event* in ``pmset -g log`` output.
-
-    Each row is ``<date> <time> <tz> <Domain>\\t<message>``; the Domain column is
-    tab-separated from the message and space-padded. ``Wake`` is a full user wake
-    (lid open / HID activity) and ``DarkWake`` a macOS maintenance wake (Power
-    Nap, keepalive) that fires every few minutes with the lid shut. Returns
-    ``True`` for a DarkWake, ``False`` for a full Wake, ``None`` if no wake row
-    qualifies.
-
-    The domain must be matched *exactly*: pmset also logs ``Wake Requests`` (the
-    schedule of upcoming wakes), ``WakeTime``, ``WakeDetails`` rows whose first
-    token is ``Wake`` — splitting on whitespace would read those as a full wake
-    and misclassify a DarkWake, so we take the whole column before the tab.
-
-    Recency is judged by when a wake *ended*, not when it began. pmset stamps a
-    row at the wake's start and appends ``N secs`` only when it ends, so a row
-    with no duration yet is the wake happening **right now** — it classifies
-    directly, regardless of how long ago it started. This is the fix for a long
-    maintenance DarkWake (mDNSResponder can hold one for minutes): mid-wake its
-    start has already aged past ``max_age``, and a start-time window would drop
-    it and fail open to a full wake — the observed lid-shut "reconnecting now
-    (wake/network return)" with the lid never opened. A *completed* wake counts
-    only if it ended within ``max_age`` of ``now``; an unparseable timestamp is
-    kept (fail open — better a spurious classification than dropping a real one).
-    """
-    apply_window = now is not None and max_age is not None
-    # The wake we care about is the newest, which sits at the tail of the log.
-    # Scan from the end and return on the first qualifying row, so we touch a
-    # handful of lines instead of walking the whole ~12MB pmset history on every
-    # wake/retry signal during an overnight sleep.
-    for line in reversed(pmset_log.splitlines()):
-        head, _, message = line.partition("\t")
-        fields = head.split(None, 3)
-        if len(fields) < 4:
-            continue
-        domain = fields[3].strip()
-        if domain not in ("Wake", "DarkWake"):
-            continue
-        duration = _parse_pmset_duration(message)
-        if duration is None:
-            # Still in progress → the current power state; classify it directly.
-            return domain == "DarkWake"
-        if apply_window:
-            ts = _parse_pmset_time(fields[0], fields[1], fields[2])
-            # Stale once it ended longer than max_age ago; an older row would be
-            # staler still, so the scan effectively yields None.
-            if ts is not None and ts + duration < now - max_age:
-                continue
-        return domain == "DarkWake"
-    return None
-
-
-def _pmset_log() -> str:
+def _pmset_systemstate() -> str:
     return subprocess.run(
-        PMSET_CMD,
+        PMSET_STATE_CMD,
         capture_output=True,
         text=True,
         timeout=PMSET_TIMEOUT,
@@ -165,30 +104,22 @@ def _pmset_log() -> str:
     ).stdout
 
 
-async def wake_is_dark(
-    *,
-    now: float | None = None,
-    max_age: float = WAKE_RECENCY,
-    clock: Callable[[], float] = time.time,
-) -> bool:
-    """Whether the wake that just happened was a macOS DarkWake, not a real one.
+async def wake_is_dark() -> bool:
+    """Whether the system is *currently* in a macOS DarkWake, not a full wake.
 
-    Only wakes within ``max_age`` seconds of ``now`` (default: the wall clock)
-    count, so a stale DarkWake from earlier can't suppress a genuine recovery —
-    see ``parse_wake_is_dark``.
+    Reads the live power state via ``pmset -g systemstate`` and classifies on the
+    Graphics capability — see ``parse_capabilities_are_dark``.
 
-    Fail-open: any uncertainty (pmset failure, no recent wake line) returns
+    Fail-open: any uncertainty (pmset failure, no capabilities line) returns
     ``False`` so the reconnect still fires — a spurious reconnect is cheap, a
     missed one leaves the phone unable to reach the daemon after the lid opens.
     """
-    if now is None:
-        now = clock()
     try:
-        text = await asyncio.to_thread(_pmset_log)
+        text = await asyncio.to_thread(_pmset_systemstate)
     except Exception:  # noqa: BLE001 - a probe failure must not block reconnect
-        logger.warning("pmset wake-type probe failed", exc_info=True)
+        logger.warning("pmset systemstate probe failed", exc_info=True)
         return False
-    return parse_wake_is_dark(text, now=now, max_age=max_age) is True
+    return parse_capabilities_are_dark(text) is True
 
 
 class ReachabilityWatcher:
