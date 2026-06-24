@@ -819,6 +819,84 @@ async def test_drive_stream_client_drained_backoff_rearms_while_dark(
     assert "reconnecting now (backoff elapsed)" in caplog.text
 
 
+async def test_drive_stream_client_dedupes_dark_wake_within_one_stretch(
+    monkeypatch, caplog
+):
+    # One long maintenance DarkWake drains the backoff several times, each
+    # re-confirming dark — the "still offline" line must be logged once per dark
+    # stretch, not once per re-arm, so a single wake can't print it 4-5 times.
+    import logging as _logging
+
+    calls = 0
+
+    async def fake_serve_once(client, *, on_connect=None, on_message=None):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise asyncio.CancelledError
+        return None
+
+    # Three drained-backoff checks classify dark before one classifies awake:
+    # only the first dark should log; the next two are suppressed repeats.
+    verdicts = iter([True, True, True, False])
+
+    async def fake_is_dark():
+        return next(verdicts)
+
+    monkeypatch.setattr(daemon, "_serve_stream_once", fake_serve_once)
+    state = daemon.ReconnectState(delays=(0.01,), jitter=False)
+
+    with caplog.at_level(_logging.INFO, logger="claude_dingtalk_bridge.daemon"):
+        with contextlib.suppress(asyncio.CancelledError):
+            await daemon._drive_stream_client(
+                object(), state=state, retry_now=asyncio.Event(),
+                disconnected=asyncio.Event(), is_dark_wake=fake_is_dark,
+            )
+    assert caplog.text.count("dark wake; still offline (maintenance wake)") == 1
+    assert "reconnecting now (backoff elapsed)" in caplog.text
+
+
+async def test_drive_stream_client_dark_wake_reannounces_on_fresh_wake(
+    monkeypatch, caplog
+):
+    # A genuinely new wake (retry_now) re-announces even if a prior drain already
+    # logged the dark line, so each wake still pairs with exactly one line rather
+    # than being swallowed by the dedup of the previous stretch.
+    import logging as _logging
+
+    calls = 0
+
+    async def fake_serve_once(client, *, on_connect=None, on_message=None):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise asyncio.CancelledError
+        return None
+
+    retry_now = asyncio.Event()
+    # First check is a drained-backoff dark (logs once); the second is a fresh
+    # wake signal classifying dark (must log again); the third is awake.
+    verdicts = iter([True, True, False])
+
+    async def fake_is_dark():
+        verdict = next(verdicts)
+        if not retry_now.is_set():
+            # After the first drain logged, arm a fresh wake for the next pass.
+            retry_now.set()
+        return verdict
+
+    monkeypatch.setattr(daemon, "_serve_stream_once", fake_serve_once)
+    state = daemon.ReconnectState(delays=(0.01,), jitter=False)
+
+    with caplog.at_level(_logging.INFO, logger="claude_dingtalk_bridge.daemon"):
+        with contextlib.suppress(asyncio.CancelledError):
+            await daemon._drive_stream_client(
+                object(), state=state, retry_now=retry_now,
+                disconnected=asyncio.Event(), is_dark_wake=fake_is_dark,
+            )
+    assert caplog.text.count("dark wake; still offline (maintenance wake)") == 2
+
+
 async def test_drive_stream_client_cancel_during_elapsed_classification(monkeypatch):
     # Cancellation while classifying a *drained* backoff (no pending signal, so
     # the check happens at the elapsed gate, not the wake path) unwinds cleanly.

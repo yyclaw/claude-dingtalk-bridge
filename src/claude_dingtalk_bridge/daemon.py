@@ -710,6 +710,12 @@ async def _backoff_until_retry(
     dark — and the *act* — ``reconnecting now (...)`` right before each real
     attempt, with the reason. The backoff tier itself stays in ``ReconnectState``.
 
+    The dark-wake line is logged once per *wake*, not once per re-arm: one long
+    maintenance DarkWake keeps the CPU up long enough for the (jittered) backoff
+    to drain and re-arm several times, each re-confirming dark, which would print
+    the identical line 4-5 times. ``dark_announced`` suppresses those drain
+    repeats; a fresh ``retry_now`` (a genuinely new wake) always re-announces.
+
     Returns ``True`` to reconnect early (caller resets the ladder), ``False`` if
     the full delay elapsed, or ``None`` if cancelled.
     """
@@ -717,6 +723,9 @@ async def _backoff_until_retry(
     pending = retry_now.is_set()
     if not pending:
         logger.info("disconnected; waiting to reconnect")
+    # Set while the current dark stretch has already been announced, so the
+    # backoff's repeated drain/re-arm within one DarkWake stays quiet.
+    dark_announced = False
     while True:
         if pending:
             pending = False
@@ -728,7 +737,10 @@ async def _backoff_until_retry(
             if not dark:
                 logger.info("reconnecting now (wake/network return)")
                 return True
+            # A genuine wake signal — always announce, even if a prior drain
+            # already did, so each wake pairs with one line.
             logger.info("dark wake; still offline (maintenance wake)")
+            dark_announced = True
             # A DarkWake's brief CPU still advances `remaining`, but the machine
             # is asleep — re-arm the full delay so the backoff can't expire
             # mid-sleep and reconnect. Only the non-dark branch above leaves.
@@ -742,7 +754,9 @@ async def _backoff_until_retry(
             except asyncio.CancelledError:
                 return None
             if dark:
-                logger.info("dark wake; still offline (maintenance wake)")
+                if not dark_announced:
+                    logger.info("dark wake; still offline (maintenance wake)")
+                    dark_announced = True
                 remaining = delay
                 continue
             logger.info("reconnecting now (backoff elapsed)")
