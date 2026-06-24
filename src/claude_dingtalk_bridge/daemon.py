@@ -654,9 +654,14 @@ async def _drive_stream_client(
             down_since = wall_clock()
             online = False
             logger.info("stream connection lost")
-        if alive_wall is not None:
-            # Skew = wall elapsed minus monotonic elapsed = time the process was
-            # suspended since last known alive (awake time advances both, cancels).
+            # Measure the suspend ONLY on this online→offline edge. A failing
+            # reconnect (e.g. DNS not ready on wake) never refreshes `alive_wall`,
+            # so re-measuring it on every failed pass would keep reading the same
+            # stale skew and re-firing the self-nudge — bypassing backoff and
+            # spinning open-connection until DNS recovers. `alive_wall` is always
+            # set here: `online` only becomes True via `_on_connect`, which sets it.
+            # Skew = wall elapsed minus monotonic elapsed = time suspended since
+            # last known alive (awake time advances both, cancels).
             slept_pending = max(
                 0.0, (wall_clock() - alive_wall) - (mono_clock() - alive_mono)
             )

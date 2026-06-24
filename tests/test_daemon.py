@@ -1202,6 +1202,46 @@ async def test_drive_stream_client_reconnects_at_once_after_a_wake(monkeypatch):
     assert calls == 2
 
 
+async def test_drive_stream_client_failed_reconnect_after_wake_backs_off(
+    monkeypatch, caplog
+):
+    # A wake kills the socket, then reconnects keep FAILING (e.g. DNS not ready on
+    # wake). The wake self-nudge must fire ONCE; the failed passes that follow must
+    # fall back to backoff, not re-measure the same stale suspend and re-nudge on
+    # every pass — that bypassed backoff and spun open-connection ~4x/s until DNS
+    # recovered (249 failures in one minute, observed in production).
+    import logging as _logging
+
+    clock = {"wall": 1000.0, "mono": 500.0}
+    calls = 0
+
+    async def fake_serve_once(client, *, on_connect=None, on_message=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            on_connect(clock["wall"])  # baseline alive (1000, 500)
+            clock["wall"] += 3000.0     # a wake killed the socket: huge skew...
+            clock["mono"] += 1.0        # ...monotonic frozen → slept ≫ threshold
+            return 0.0                  # drop
+        if calls >= 5:
+            raise asyncio.CancelledError
+        return None  # reconnect fails (never connects) — DNS not ready on wake
+
+    monkeypatch.setattr(daemon, "_serve_stream_once", fake_serve_once)
+    state = daemon.ReconnectState(delays=(0.0,), jitter=False)
+    with caplog.at_level(_logging.INFO, logger="claude_dingtalk_bridge.daemon"):
+        with contextlib.suppress(asyncio.CancelledError):
+            await daemon._drive_stream_client(
+                object(), state=state, retry_now=asyncio.Event(),
+                disconnected=asyncio.Event(), is_dark_wake=_not_dark,
+                wall_clock=lambda: clock["wall"], mono_clock=lambda: clock["mono"],
+            )
+    # The wake reconnects once; subsequent failed retries back off instead of
+    # re-firing the self-nudge every pass.
+    assert caplog.text.count("reconnecting now (wake/network return)") == 1
+    assert "disconnected; waiting to reconnect" in caplog.text
+
+
 async def test_send_offline_notice_pushes_formatted_message():
     sent = []
 
