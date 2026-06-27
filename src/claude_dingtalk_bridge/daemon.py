@@ -739,7 +739,7 @@ async def _backoff_until_retry(
                 return True
             # A genuine wake signal — always announce, even if a prior drain
             # already did, so each wake pairs with one line.
-            logger.info("dark wake; still offline (maintenance wake)")
+            # logger.info("dark wake; still offline (maintenance wake)")
             dark_announced = True
             # A DarkWake's brief CPU still advances `remaining`, but the machine
             # is asleep — re-arm the full delay so the backoff can't expire
@@ -755,7 +755,7 @@ async def _backoff_until_retry(
                 return None
             if dark:
                 if not dark_announced:
-                    logger.info("dark wake; still offline (maintenance wake)")
+                    # logger.info("dark wake; still offline (maintenance wake)")
                     dark_announced = True
                 remaining = delay
                 continue

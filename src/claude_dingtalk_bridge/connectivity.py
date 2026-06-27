@@ -196,7 +196,7 @@ async def watch_wake(
             offline = watcher.tick(wall=wall_clock(), mono=mono_clock())
             if offline is None or not is_disconnected():
                 continue
-            logger.info("woke from sleep during backoff; re-checking connection")
+            # logger.info("woke from sleep during backoff; re-checking connection")
             on_wake()
         except Exception:  # noqa: BLE001 - one bad tick must not kill the watcher
             logger.warning("wake watcher tick failed", exc_info=True)
